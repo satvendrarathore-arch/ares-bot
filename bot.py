@@ -135,6 +135,75 @@ def pub_funding(sym):
         return 0.0
 
 
+# ── Sentiment Data (FREE APIs) ────────────────────────────────
+
+def fetch_fear_greed():
+    """Fear & Greed Index — alternative.me (FREE)"""
+    try:
+        r = requests.get("https://api.alternative.me/fng/", timeout=8)
+        d = r.json().get("data", [])
+        if d:
+            value = int(d[0].get("value", 50))
+            classification = d[0].get("value_classification", "Neutral")
+            return value, classification
+    except Exception as e:
+        log.warning(f"Fear & Greed fetch error: {e}")
+    return 50, "Neutral"
+
+def fetch_news_sentiment():
+    """CryptoPanic news sentiment — FREE tier"""
+    try:
+        r = requests.get(
+            "https://cryptopanic.com/api/free/v1/posts/",
+            params={"public": "true", "currencies": "BTC,ETH"},
+            timeout=8
+        )
+        data = r.json()
+        posts = data.get("results", [])[:20]  # Last 20 news
+        bullish = sum(1 for p in posts if p.get("votes", {}).get("positive", 0) > p.get("votes", {}).get("negative", 0))
+        bearish = sum(1 for p in posts if p.get("votes", {}).get("negative", 0) > p.get("votes", {}).get("positive", 0))
+        total = max(len(posts), 1)
+        sentiment = (bullish - bearish) / total * 100  # -100 to +100
+        return sentiment, bullish, bearish
+    except Exception as e:
+        log.warning(f"News fetch error: {e}")
+    return 0, 0, 0
+
+def fetch_btc_dominance():
+    """BTC Dominance — CoinGecko (FREE)"""
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/global", timeout=8)
+        d = r.json().get("data", {})
+        dom = d.get("market_cap_percentage", {}).get("btc", 50)
+        return float(dom)
+    except Exception as e:
+        log.warning(f"BTC dominance error: {e}")
+    return 50.0
+
+# Cache sentiment data (refresh every 30 min)
+SENTIMENT_CACHE = {"data": None, "timestamp": 0}
+
+def get_sentiment():
+    """Get cached sentiment data (refresh every 30 min)"""
+    now = time.time()
+    if SENTIMENT_CACHE["data"] is None or (now - SENTIMENT_CACHE["timestamp"]) > 1800:
+        log.info("[SENTIMENT] Refreshing market sentiment data...")
+        fg_value, fg_class = fetch_fear_greed()
+        news_sent, bull_news, bear_news = fetch_news_sentiment()
+        btc_dom = fetch_btc_dominance()
+        SENTIMENT_CACHE["data"] = {
+            "fg_value": fg_value,
+            "fg_class": fg_class,
+            "news_sent": news_sent,
+            "bull_news": bull_news,
+            "bear_news": bear_news,
+            "btc_dom": btc_dom,
+        }
+        SENTIMENT_CACHE["timestamp"] = now
+        log.info(f"[SENTIMENT] F&G:{fg_value}({fg_class}) | News:{news_sent:+.0f}% ({bull_news}🟢/{bear_news}🔴) | BTC.D:{btc_dom:.1f}%")
+    return SENTIMENT_CACHE["data"]
+
+
 # ── Account (Authenticated) ───────────────────────────────────
 
 def fetch_balance():
@@ -504,6 +573,37 @@ def generate_signal(sym, tick, cdata, fund):
     elif chg < -4: bear += 2
     elif chg < -2: bear += 1
 
+    # 13. SENTIMENT — Fear & Greed Index 😱🤑
+    sentiment = get_sentiment()
+    fg = sentiment["fg_value"]
+    if fg <= 20:  # Extreme Fear
+        bull += 4; reasons.append(f"✅ Extreme Fear {fg} — buy opportunity")
+    elif fg <= 35:  # Fear
+        bull += 2; reasons.append(f"✅ Market fearful {fg} — bullish")
+    elif fg >= 80:  # Extreme Greed
+        bear += 4; reasons.append(f"🔴 Extreme Greed {fg} — caution!")
+    elif fg >= 65:  # Greed
+        bear += 2; reasons.append(f"🔴 Market greedy {fg} — bearish")
+
+    # 14. NEWS SENTIMENT 📰
+    news_sent = sentiment["news_sent"]
+    if news_sent > 30:
+        bull += 3; reasons.append(f"✅ News very bullish ({sentiment['bull_news']} positive)")
+    elif news_sent > 10:
+        bull += 1
+    elif news_sent < -30:
+        bear += 3; reasons.append(f"🔴 News very bearish ({sentiment['bear_news']} negative)")
+    elif news_sent < -10:
+        bear += 1
+
+    # 15. BTC DOMINANCE 👑 (only relevant for ETH)
+    if sym == "ETHUSDT":
+        btc_dom = sentiment["btc_dom"]
+        if btc_dom > 55:  # BTC dominating, alts weak
+            bear += 1; reasons.append(f"🔴 BTC dominance high {btc_dom:.1f}%")
+        elif btc_dom < 45:  # Alt season
+            bull += 1; reasons.append(f"✅ Alt season BTC.D {btc_dom:.1f}%")
+
     total = bull + bear
     if total == 0:
         return None
@@ -675,8 +775,8 @@ def print_report(bal):
 
 def run():
     log.info("╔══════════════════════════════════════════════════╗")
-    log.info("║  ▲ ARES ULTRA v4.1 — World #1 Futures Bot       ║")
-    log.info("║  Bitget USDT-M | BTC + ETH | BALANCE FIXED      ║")
+    log.info("║  ▲ ARES ULTRA v4.2 — Smart Sentiment Bot        ║")
+    log.info("║  Bitget USDT-M | BTC + ETH | F&G + News         ║")
     log.info(f"║  Compound:{COMPOUND_PCT*100:.0f}% | MaxLev:{MAX_LEVERAGE}x | Trades:{MAX_TRADES}  ║")
     log.info("╚══════════════════════════════════════════════════╝")
 
