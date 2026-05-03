@@ -101,14 +101,28 @@ def pub_ticker(sym):
         log.error(f"Ticker error: {e}")
         return None
 
-def pub_candles(sym, gran="15", limit=150):
+def pub_candles(sym, gran="15m", limit=150):
+    """
+    FIXED: Bitget v2 requires granularity with unit suffix
+    5 → 5m, 15 → 15m, 60 → 1H, 240 → 4H
+    """
+    # Convert old format to new format
+    gran_map = {"5": "5m", "15": "15m", "60": "1H", "240": "4H",
+                "1": "1m", "30": "30m", "120": "2H", "360": "6H"}
+    gran = gran_map.get(str(gran), gran)
+    
     try:
         r = requests.get(f"{BASE_URL}/api/v2/mix/market/candles",
             params={"symbol": sym, "productType": PRODUCT_TYPE,
                     "granularity": gran, "limit": str(limit)}, timeout=10)
-        return r.json().get("data", [])
+        data = r.json()
+        if data.get("code") == "00000":
+            return data.get("data", [])
+        else:
+            log.warning(f"[CANDLES] {sym} {gran}: {data.get('msg', 'Unknown error')}")
+            return []
     except Exception as e:
-        log.error(f"Candles error: {e}")
+        log.error(f"Candles error {sym}: {e}")
         return []
 
 def pub_funding(sym):
