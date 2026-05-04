@@ -33,7 +33,7 @@ TP1_MULT      = 2.0
 TP2_MULT      = 3.5
 TP3_MULT      = 6.0
 TRAIL_MULT    = 1.0
-MIN_CONF      = 70
+MIN_CONF      = 65
 MAX_DAILY_LOSS= 0.06
 MAX_DRAWDOWN  = 0.12
 
@@ -611,10 +611,10 @@ def generate_signal(sym, tick, cdata, fund):
     bull_pct = (bull / total) * 100
     bear_pct = 100 - bull_pct
 
-    if bull >= 20 and bull_pct >= 63:
+    if bull >= 12 and bull_pct >= 65:
         action, side, hold = "LONG", "buy", "long"
         conf = min(97, int(bull_pct))
-    elif bear >= 20 and bear_pct >= 63:
+    elif bear >= 12 and bear_pct >= 65:
         action, side, hold = "SHORT", "sell", "short"
         conf = min(97, int(bear_pct))
     else:
