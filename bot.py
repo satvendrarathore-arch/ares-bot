@@ -1,18 +1,39 @@
 """
-ARES ULTRA v6.0 — Production-Ready Architecture
+ARES ULTRA v6.4 — Pro Risk Management
 Bitget USDT-M Perpetuals | BTC + ETH
 
-KEY ARCHITECTURAL CHANGES FROM v5.1:
+v6.4 ADDITIONS (over v6.3):
+- Circuit Breakers: auto-pause on losses/anomalies
+- Exchange Outage Detection: pause when Bitget down
+- Correlation-Aware Sizing: reduce risk for BTC+ETH together
+- Slippage Model: realistic entry price estimates
+- Regime Classifier: TRENDING/RANGING/VOLATILE adaptation
+- Shadow Mode: SHADOW_MODE=true tests strategy without money
+
+v6.3 INHERITED:
+- Mini-Backtest: validates each signal against past 280+ candle setups
+- Pattern Memory: bot learns from its own past trades
+- Triple-filter trade approval (confidence + backtest + pattern)
+- Pattern memory pruning (auto-cleanup of stale patterns)
+
+ARCHITECTURAL FOUNDATION (v6.0+):
 1. Exchange = Single Source of Truth (no internal state desync)
 2. All TP/SL operations are atomic (cancel-then-place)
 3. Leverage verification before every order
 4. Pending orders auto-cleanup on close
 5. Live position size sync (no stale data)
-6. API retry on ALL endpoints
+6. API retry on ALL endpoints with rate limit handling
 7. Funding-aware trade gating with safe fallbacks
 8. Volume/OHLC data validation
-9. Telegram notifications (optional)
+9. Telegram notifications (urgent: trade events, batched: routine)
 10. Race condition eliminated (TP3 handled by exchange only)
+
+FIXES applied (bot_fixed.py):
+- Bug A: Removed dead unreachable code in check_circuit_breakers()
+- Bug B: Per-symbol open check now uses all_open (exchange + tracked),
+         preventing duplicate entries on manually-opened Bitget positions
+- Bug C: Trade notification now shows actual_entry (fill price), not
+         the pre-entry market quote
 """
 
 import os, time, hmac, hashlib, base64, json, logging, requests
@@ -33,17 +54,35 @@ PASSPHRASE   = os.environ.get("BITGET_PASSPHRASE", "")
 TG_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "")
 TG_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-MAX_LEVERAGE  = int(os.environ.get("MAX_LEVERAGE", "10"))
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SECONDS", "120"))
-COMPOUND_PCT  = float(os.environ.get("COMPOUND_PCT", "20")) / 100
-MAX_TRADES    = int(os.environ.get("MAX_TRADES", "2"))
+def _env_int(name, default):
+    raw = os.environ.get(name, str(default))
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        print(f"⚠️ Invalid {name}='{raw}', using default {default}")
+        return default
+
+def _env_float(name, default):
+    raw = os.environ.get(name, str(default))
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        print(f"⚠️ Invalid {name}='{raw}', using default {default}")
+        return default
+
+MAX_LEVERAGE  = _env_int("MAX_LEVERAGE", 10)
+SCAN_INTERVAL = _env_int("SCAN_INTERVAL_SECONDS", 120)
+COMPOUND_PCT  = _env_float("COMPOUND_PCT", 20) / 100
+MAX_TRADES    = _env_int("MAX_TRADES", 2)
 RESET_STATS   = os.environ.get("RESET_STATS", "false").lower() == "true"
+SHADOW_MODE   = os.environ.get("SHADOW_MODE", "false").lower() == "true"
 
 BASE_URL     = "https://api.bitget.com"
 PRODUCT_TYPE = "USDT-FUTURES"
 SYMBOLS      = ["BTCUSDT", "ETHUSDT"]
-STATE_FILE   = "/tmp/ares_v62_state.json"
+STATE_FILE   = "/tmp/ares_v64_state.json"
 
+# ── Risk constants ────────────────────────────────────────────
 SL_MULT        = 1.5
 TP1_MULT       = 2.0
 TP2_MULT       = 3.5
@@ -53,8 +92,28 @@ MIN_CONF       = 65
 MAX_DAILY_LOSS = 0.06
 MAX_DRAWDOWN   = 0.12
 MAX_VOLAT      = 8.0
-MIN_SL_IMPROVE = 0.001  # 0.1% — minimum SL improvement to trigger update (reduces API spam)
-# Dynamic min margin: max($3, balance × 8%) — calculated in compound_size()
+MIN_SL_IMPROVE = 0.003
+
+# ── Circuit Breakers ──────────────────────────────────────────
+CB_CONSECUTIVE_LOSSES    = 5
+CB_CONSECUTIVE_API_FAILS = 10
+CB_HOURLY_LOSS_PCT       = 0.04
+CB_PAUSE_DURATION        = 3600
+
+# ── Exchange Outage Detection ─────────────────────────────────
+OUTAGE_FAIL_THRESHOLD = 5
+OUTAGE_RETRY_INTERVAL = 60
+
+# ── Correlation-Aware Sizing ──────────────────────────────────
+CORR_REDUCTION = 0.65
+
+# ── Slippage Model ────────────────────────────────────────────
+SLIPPAGE_BPS_LOW  = 5
+SLIPPAGE_BPS_HIGH = 20
+
+# ── Regime Classifier ─────────────────────────────────────────
+REGIME_ADX_TREND  = 25
+REGIME_VOLAT_HIGH = 4.0
 
 SYMBOL_SPECS = {
     "BTCUSDT": {"min_size": 0.0001, "precision": 4, "price_precision": 1},
@@ -64,17 +123,21 @@ SYMBOL_SPECS = {
 }
 
 S = {
-    "start_bal":    0.0,
-    "peak_bal":     0.0,
-    "daily_pnl":    0.0,
-    "total_pnl":    0.0,
-    "wins":         0,
-    "losses":       0,
-    "loss_streak":  0,
-    "win_streak":   0,
-    "daily_start":  datetime.now().date(),
-    "trade_meta":   {},
-    "pattern_memory": {},  # Pattern Memory: tracks win/loss for each setup signature
+    "start_bal":      0.0,
+    "peak_bal":       0.0,
+    "daily_pnl":      0.0,
+    "total_pnl":      0.0,
+    "wins":           0,
+    "losses":         0,
+    "loss_streak":    0,
+    "win_streak":     0,
+    "daily_start":    datetime.now(timezone.utc).date(),
+    "trade_meta":     {},
+    "pattern_memory": {},
+    "recent_pnl_log": [],
+    "cb_paused_until": 0,
+    "cb_reason":      "",
+    "shadow_trades":  [],
 }
 
 SENTIMENT_CACHE = {"data": None, "timestamp": 0}
@@ -83,19 +146,73 @@ SENTIMENT_CACHE = {"data": None, "timestamp": 0}
 # ── State Persistence ─────────────────────────────────────────
 
 def load_state():
-    if not os.path.exists(STATE_FILE):
-        return
+    target_file = STATE_FILE
+    if not os.path.exists(target_file):
+        legacy_file = "/tmp/ares_v63_state.json"
+        if os.path.exists(legacy_file):
+            log.info("[STATE] Migrating v6.3 → v6.4 state (pattern_memory preserved)")
+            target_file = legacy_file
+        else:
+            return
     try:
-        with open(STATE_FILE) as f:
+        with open(target_file) as f:
             saved = json.load(f)
+        expected_types = {
+            "start_bal": (int, float),
+            "peak_bal": (int, float),
+            "daily_pnl": (int, float),
+            "total_pnl": (int, float),
+            "wins": int,
+            "losses": int,
+            "loss_streak": int,
+            "win_streak": int,
+            "trade_meta": dict,
+            "pattern_memory": dict,
+            "recent_pnl_log": list,
+            "cb_paused_until": (int, float),
+            "cb_reason": str,
+            "shadow_trades": list,
+        }
         for k, v in saved.items():
             if k == "daily_start":
                 try:
                     S[k] = datetime.fromisoformat(v).date()
-                except:
-                    S[k] = datetime.now().date()
+                except (ValueError, TypeError):
+                    S[k] = datetime.now(timezone.utc).date()
             elif k in S:
-                S[k] = v
+                if k in expected_types:
+                    if isinstance(v, expected_types[k]):
+                        S[k] = v
+                    else:
+                        log.warning(f"[STATE] {k} has wrong type "
+                                    f"({type(v).__name__} not {expected_types[k]}), keeping default")
+                else:
+                    S[k] = v
+
+        # Migrate v6.3 pattern keys (no regime suffix) to v6.4 format
+        pm = S.get("pattern_memory", {})
+        if pm and isinstance(pm, dict):
+            migrated = {}
+            migration_count = 0
+            for key, val in pm.items():
+                if isinstance(key, str) and "Reg_" not in key:
+                    new_key = key + "|Reg_UNKNOWN"
+                    migrated[new_key] = val
+                    migration_count += 1
+                else:
+                    migrated[key] = val
+            if migration_count > 0:
+                log.info(f"[STATE] Migrated {migration_count} v6.3 pattern keys → v6.4 format")
+                S["pattern_memory"] = migrated
+
+        tm = S.get("trade_meta", {})
+        if tm and isinstance(tm, dict):
+            for sym, meta in tm.items():
+                if isinstance(meta, dict):
+                    old_sig = meta.get("pattern_sig")
+                    if isinstance(old_sig, str) and "Reg_" not in old_sig:
+                        meta["pattern_sig"] = old_sig + "|Reg_UNKNOWN"
+
         log.info(f"[STATE] Restored: {S['wins']}W/{S['losses']}L | "
                  f"PnL:${S['total_pnl']:.2f}")
     except Exception as e:
@@ -117,43 +234,45 @@ def save_state():
         log.warning(f"[STATE] Save failed: {e}")
 
 def reset_stats():
-    """Reset stats for fresh start (preserves trade_meta)."""
     log.info("[INIT] 🔄 Stats reset requested via RESET_STATS env var")
-    S["start_bal"] = 0.0
-    S["peak_bal"] = 0.0
-    S["total_pnl"] = 0.0
-    S["daily_pnl"] = 0.0
-    S["wins"] = 0
-    S["losses"] = 0
-    S["loss_streak"] = 0
-    S["win_streak"] = 0
-    S["daily_start"] = datetime.now().date()
+    S["start_bal"]      = 0.0
+    S["peak_bal"]       = 0.0
+    S["total_pnl"]      = 0.0
+    S["daily_pnl"]      = 0.0
+    S["wins"]           = 0
+    S["losses"]         = 0
+    S["loss_streak"]    = 0
+    S["win_streak"]     = 0
+    S["daily_start"]    = datetime.now(timezone.utc).date()
+    S["recent_pnl_log"] = []
+    S["cb_paused_until"] = 0
+    S["cb_reason"]      = ""
+    S["shadow_trades"]  = []
     save_state()
-    log.info("[INIT] ✅ Stats reset complete")
+    log.info("[INIT] ✅ Stats reset complete (pattern_memory preserved)")
 
 
 # ── Telegram (with batching) ──────────────────────────────────
 
-NOTIFY_BUFFER = []
-NOTIFY_LAST_FLUSH = time.time()
-NOTIFY_FLUSH_INTERVAL = 600  # 10 minutes
-NOTIFY_BUFFER_MAX = 10
+NOTIFY_BUFFER        = []
+NOTIFY_LAST_FLUSH    = time.time()
+NOTIFY_FLUSH_INTERVAL = 600
+NOTIFY_BUFFER_MAX    = 10
 
 def _send_telegram_now(msg):
-    """Send message to Telegram immediately."""
     if not TG_TOKEN or not TG_CHAT_ID:
         return
+    safe_msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            json={"chat_id": TG_CHAT_ID, "text": safe_msg, "parse_mode": "HTML"},
             timeout=5
         )
     except Exception as e:
         log.debug(f"[TG] Failed: {e}")
 
 def flush_notifications():
-    """Send buffered notifications as single combined message."""
     global NOTIFY_LAST_FLUSH
     if not NOTIFY_BUFFER:
         return
@@ -163,20 +282,17 @@ def flush_notifications():
     NOTIFY_LAST_FLUSH = time.time()
 
 def notify(msg, urgent=False):
-    """Buffered notifications. Urgent sends immediately, routine batched."""
     global NOTIFY_LAST_FLUSH
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     if urgent:
         _send_telegram_now(f"🚨 {msg}")
         return
-    # Buffer non-urgent messages
     timestamp = datetime.now().strftime("%H:%M")
     NOTIFY_BUFFER.append(f"{timestamp} {msg}")
-    # Flush if buffer full or 10 minutes passed
     now = time.time()
     if (len(NOTIFY_BUFFER) >= NOTIFY_BUFFER_MAX or
-        now - NOTIFY_LAST_FLUSH >= NOTIFY_FLUSH_INTERVAL):
+            now - NOTIFY_LAST_FLUSH >= NOTIFY_FLUSH_INTERVAL):
         flush_notifications()
 
 
@@ -192,35 +308,35 @@ def call(method, path, params=None, body=None, retries=3):
     for attempt in range(retries):
         t = str(int(time.time() * 1000))
         headers = {
-            "Content-Type": "application/json",
-            "ACCESS-KEY": API_KEY,
+            "Content-Type":     "application/json",
+            "ACCESS-KEY":       API_KEY,
             "ACCESS-TIMESTAMP": t,
             "ACCESS-PASSPHRASE": PASSPHRASE,
-            "locale": "en-US",
+            "locale":           "en-US",
         }
         try:
             if method == "GET" and params:
                 qs = "&".join(f"{k}={v}" for k, v in params.items())
-                headers["ACCESS-SIGN"] = _sign(SECRET_KEY,
-                    t + "GET" + path + "?" + qs)
-                r = requests.get(BASE_URL + path + "?" + qs,
-                    headers=headers, timeout=12)
+                headers["ACCESS-SIGN"] = _sign(SECRET_KEY, t + "GET" + path + "?" + qs)
+                r = requests.get(BASE_URL + path + "?" + qs, headers=headers, timeout=12)
             elif method == "POST":
                 bs = json.dumps(body) if body else ""
-                headers["ACCESS-SIGN"] = _sign(SECRET_KEY,
-                    t + "POST" + path + bs)
-                r = requests.post(BASE_URL + path, headers=headers,
-                    data=bs, timeout=12)
+                headers["ACCESS-SIGN"] = _sign(SECRET_KEY, t + "POST" + path + bs)
+                r = requests.post(BASE_URL + path, headers=headers, data=bs, timeout=12)
             else:
-                headers["ACCESS-SIGN"] = _sign(SECRET_KEY,
-                    t + "GET" + path)
-                r = requests.get(BASE_URL + path,
-                    headers=headers, timeout=12)
+                headers["ACCESS-SIGN"] = _sign(SECRET_KEY, t + "GET" + path)
+                r = requests.get(BASE_URL + path, headers=headers, timeout=12)
             result = r.json()
             last_result = result
             if result.get("code") == "00000":
+                register_api_success()
                 return result
             err_code = result.get("code", "")
+            if r.status_code == 429 or err_code in ["429", "50054"]:
+                wait = 10 * (attempt + 1)
+                log.warning(f"[API] Rate limited (status={r.status_code}), waiting {wait}s")
+                time.sleep(wait)
+                continue
             if err_code in ["40001", "40002", "40003", "40009", "40037"]:
                 log.error(f"[API] Auth/param error: {result.get('msg')}")
                 return result
@@ -230,6 +346,7 @@ def call(method, path, params=None, body=None, retries=3):
                 time.sleep(wait)
         except Exception as e:
             log.error(f"[API] {method} {path}: {e}")
+            register_api_failure()
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
     return last_result
@@ -286,13 +403,13 @@ def pub_funding(sym):
         d = data.get("data", [])
         if d:
             try:
-                rate = float(d[0].get("fundingRate", 0))
+                rate   = float(d[0].get("fundingRate", 0))
                 next_ms = int(d[0].get("nextFundingTime", 0))
                 if next_ms > 0:
                     now_ms = int(time.time() * 1000)
-                    mins = max(0, int((next_ms - now_ms) / 60000))
+                    mins   = max(0, int((next_ms - now_ms) / 60000))
                     return rate, mins
-            except:
+            except Exception:
                 pass
     data = pub_get("/api/v2/mix/market/current-fund-rate",
                    {"symbol": sym, "productType": PRODUCT_TYPE})
@@ -301,7 +418,7 @@ def pub_funding(sym):
         try:
             rate = float(d[0].get("fundingRate", 0)) if d else 0.0
             return rate, -1
-        except:
+        except Exception:
             pass
     return 0.0, -1
 
@@ -314,24 +431,24 @@ def fetch_fear_greed():
         d = r.json().get("data", [])
         if d:
             return int(d[0].get("value", 50)), d[0].get("value_classification", "Neutral")
-    except:
+    except Exception:
         pass
     return None, None
 
 def fetch_news_sentiment():
     try:
         r = requests.get("https://cryptopanic.com/api/free/v1/posts/",
-            params={"public": "true", "currencies": "BTC,ETH"}, timeout=8)
+                         params={"public": "true", "currencies": "BTC,ETH"}, timeout=8)
         posts = r.json().get("results", [])[:20]
-        bull = sum(1 for p in posts
-            if p.get("votes", {}).get("positive", 0) >
-               p.get("votes", {}).get("negative", 0))
-        bear = sum(1 for p in posts
-            if p.get("votes", {}).get("negative", 0) >
-               p.get("votes", {}).get("positive", 0))
+        bull  = sum(1 for p in posts
+                    if p.get("votes", {}).get("positive", 0) >
+                       p.get("votes", {}).get("negative", 0))
+        bear  = sum(1 for p in posts
+                    if p.get("votes", {}).get("negative", 0) >
+                       p.get("votes", {}).get("positive", 0))
         total = max(len(posts), 1)
         return (bull - bear) / total * 100, bull, bear
-    except:
+    except Exception:
         return None, 0, 0
 
 def fetch_btc_dominance():
@@ -339,17 +456,23 @@ def fetch_btc_dominance():
         r = requests.get("https://api.coingecko.com/api/v3/global", timeout=8)
         d = r.json().get("data", {})
         return float(d.get("market_cap_percentage", {}).get("btc", 50))
-    except:
+    except Exception:
         return None
 
 def get_sentiment():
-    now = time.time()
-    if (SENTIMENT_CACHE["data"] is None or
-        (now - SENTIMENT_CACHE["timestamp"]) > 1800):
+    now      = time.time()
+    cached   = SENTIMENT_CACHE.get("data")
+    cache_age = now - SENTIMENT_CACHE["timestamp"]
+    all_none = cached is not None and all(
+        cached.get(k) is None for k in ["fg_value", "news_sent", "btc_dom"]
+    )
+    cache_ttl = 300 if all_none else 1800
+
+    if cached is None or cache_age > cache_ttl:
         log.info("[SENTIMENT] Refreshing...")
-        fg_val, fg_cls = fetch_fear_greed()
+        fg_val, fg_cls      = fetch_fear_greed()
         news_sent, bull, bear = fetch_news_sentiment()
-        btc_dom = fetch_btc_dominance()
+        btc_dom             = fetch_btc_dominance()
         SENTIMENT_CACHE["data"] = {
             "fg_value":  fg_val,
             "fg_class":  fg_cls,
@@ -366,17 +489,15 @@ def get_sentiment():
             parts.append(f"News:{news_sent:+.0f}%")
         if btc_dom is not None:
             parts.append(f"BTC.D:{btc_dom:.1f}%")
-        log.info(f"[SENTIMENT] {' | '.join(parts) if parts else 'all unavailable'}")
+        log.info(f"[SENTIMENT] {' | '.join(parts) if parts else 'all unavailable (retry in 5min)'}")
     return SENTIMENT_CACHE["data"]
 
 
 # ── Authenticated Endpoints ───────────────────────────────────
 
 def fetch_recent_fills(sym, limit=30):
-    """Get actual trade fills from Bitget for accurate PnL."""
     res = call("GET", "/api/v2/mix/order/fills",
-               params={"productType": PRODUCT_TYPE, "symbol": sym,
-                       "limit": str(limit)})
+               params={"productType": PRODUCT_TYPE, "symbol": sym, "limit": str(limit)})
     if res and res.get("code") == "00000":
         data = res.get("data", {})
         if isinstance(data, dict):
@@ -392,16 +513,20 @@ def fetch_balance():
             if item.get("marginCoin", "").upper() == "USDT":
                 try:
                     return float(item.get("available", 0))
-                except:
+                except Exception:
                     pass
     return 0.0
 
 def fetch_positions():
+    """Returns list of open positions, or None on API failure.
+    Callers must distinguish [] (no positions) from None (API failure).
+    """
     res = call("GET", "/api/v2/mix/position/all-position",
                params={"productType": PRODUCT_TYPE, "marginCoin": "USDT"})
-    if res and res.get("data"):
-        return [p for p in res["data"] if float(p.get("total", 0)) > 0]
-    return []
+    if not res or res.get("code") != "00000":
+        return None
+    data = res.get("data") or []
+    return [p for p in data if float(p.get("total", 0)) > 0]
 
 def fetch_pending_plan_orders(sym):
     res = call("GET", "/api/v2/mix/order/orders-plan-pending",
@@ -412,11 +537,11 @@ def fetch_pending_plan_orders(sym):
 
 def cancel_plan_order(sym, order_id, plan_type):
     res = call("POST", "/api/v2/mix/order/cancel-plan-order", body={
-        "symbol": sym,
+        "symbol":      sym,
         "productType": PRODUCT_TYPE,
-        "marginCoin": "USDT",
+        "marginCoin":  "USDT",
         "orderIdList": [{"orderId": order_id}],
-        "planType": plan_type,
+        "planType":    plan_type,
     })
     return res and res.get("code") == "00000"
 
@@ -426,7 +551,7 @@ def cancel_all_plan_orders(sym):
         return 0
     cancelled = 0
     for order in orders:
-        oid = order.get("orderId")
+        oid   = order.get("orderId")
         ptype = order.get("planType")
         if cancel_plan_order(sym, oid, ptype):
             cancelled += 1
@@ -436,7 +561,7 @@ def cancel_all_plan_orders(sym):
     return cancelled
 
 def cancel_sl_orders_only(sym):
-    orders = fetch_pending_plan_orders(sym)
+    orders    = fetch_pending_plan_orders(sym)
     cancelled = 0
     for order in orders:
         if order.get("planType") == "loss_plan":
@@ -449,11 +574,11 @@ def set_leverage(sym, lev):
     success = True
     for side in ["long", "short"]:
         res = call("POST", "/api/v2/mix/account/set-leverage", body={
-            "symbol": sym,
+            "symbol":      sym,
             "productType": PRODUCT_TYPE,
-            "marginCoin": "USDT",
-            "leverage": str(lev),
-            "holdSide": side,
+            "marginCoin":  "USDT",
+            "leverage":    str(lev),
+            "holdSide":    side,
         })
         if not res or res.get("code") != "00000":
             err = res.get("msg") if res else "No response"
@@ -463,43 +588,49 @@ def set_leverage(sym, lev):
 
 def place_market_order(sym, side, size, trade_side):
     return call("POST", "/api/v2/mix/order/place-order", body={
-        "symbol": sym,
+        "symbol":      sym,
         "productType": PRODUCT_TYPE,
-        "marginMode": "isolated",
-        "marginCoin": "USDT",
-        "size": str(size),
-        "side": side,
-        "tradeSide": trade_side,
-        "orderType": "market",
-        "force": "gtc",
+        "marginMode":  "isolated",
+        "marginCoin":  "USDT",
+        "size":        str(size),
+        "side":        side,
+        "tradeSide":   trade_side,
+        "orderType":   "market",
+        "force":       "gtc",
     })
 
 def place_plan_order(sym, plan_type, trigger_px, hold_side, size):
+    spec     = SYMBOL_SPECS.get(sym, {"price_precision": 2})
+    px_prec  = spec.get("price_precision", 2)
     res = call("POST", "/api/v2/mix/order/place-tpsl-order", body={
-        "symbol": sym,
-        "productType": PRODUCT_TYPE,
-        "marginCoin": "USDT",
-        "planType": plan_type,
-        "triggerPrice": str(round(trigger_px, 2)),
-        "triggerType": "mark_price",
+        "symbol":       sym,
+        "productType":  PRODUCT_TYPE,
+        "marginCoin":   "USDT",
+        "planType":     plan_type,
+        "triggerPrice": str(round(trigger_px, px_prec)),
+        "triggerType":  "mark_price",
         "executePrice": "0",
-        "holdSide": hold_side,
-        "size": str(size),
+        "holdSide":     hold_side,
+        "size":         str(size),
     })
     return res and res.get("code") == "00000"
 
 
 # ── Risk Setup ────────────────────────────────────────────────
 
-def setup_protection(sym, hold_side, sl, tp1, tp2, tp3, total_size):
-    spec = SYMBOL_SPECS.get(sym, {"precision": 4, "min_size": 0.0001})
+def setup_protection(sym, hold_side, sl, tp1, tp2, tp3, total_size, skip_sl=False):
+    """Place SL + 3 TPs on exchange.
+    skip_sl=True: caller already placed SL (minimises naked-position window).
+    """
+    spec      = SYMBOL_SPECS.get(sym, {"precision": 4, "min_size": 0.0001})
     full_size = round(total_size, spec["precision"])
-    if not place_plan_order(sym, "loss_plan", sl, hold_side, full_size):
-        log.error(f"[PROTECTION] {sym} SL placement FAILED")
-        notify(f"❌ {sym} SL placement failed!", urgent=True)
-        return False
-    log.info(f"[PROTECTION] {sym} SL @ ${sl:,.2f}")
-    time.sleep(0.4)
+    if not skip_sl:
+        if not place_plan_order(sym, "loss_plan", sl, hold_side, full_size):
+            log.error(f"[PROTECTION] {sym} SL placement FAILED")
+            notify(f"❌ {sym} SL placement failed!", urgent=True)
+            return False
+        log.info(f"[PROTECTION] {sym} SL @ ${sl:,.2f}")
+        time.sleep(0.4)
     tp1_size = round(total_size * 0.25, spec["precision"])
     tp2_size = round(total_size * 0.50, spec["precision"])
     tp3_size = round(total_size - tp1_size - tp2_size, spec["precision"])
@@ -508,8 +639,8 @@ def setup_protection(sym, hold_side, sl, tp1, tp2, tp3, total_size):
         place_plan_order(sym, "profit_plan", tp3, hold_side, full_size)
         return True
     for tp_px, sz, label in [(tp1, tp1_size, "TP1"),
-                             (tp2, tp2_size, "TP2"),
-                             (tp3, tp3_size, "TP3")]:
+                              (tp2, tp2_size, "TP2"),
+                              (tp3, tp3_size, "TP3")]:
         if place_plan_order(sym, "profit_plan", tp_px, hold_side, sz):
             log.info(f"[PROTECTION] {sym} {label} @ ${tp_px:,.2f} (size {sz})")
         else:
@@ -545,7 +676,7 @@ def ema(data, p):
 def ema_series(data, p):
     if len(data) < p:
         return [data[-1]] * len(data) if data else [0]
-    k = 2 / (p + 1)
+    k   = 2 / (p + 1)
     out = [sum(data[:p]) / p]
     for x in data[p:]:
         out.append(x * k + out[-1] * (1 - k))
@@ -568,7 +699,7 @@ def calc_macd(closes):
         return 0, 0, 0
     e12 = ema_series(closes, 12)
     e26 = ema_series(closes, 26)
-    ml = [e12[i] - e26[i] for i in range(min(len(e12), len(e26)))]
+    ml  = [e12[i] - e26[i] for i in range(min(len(e12), len(e26)))]
     if len(ml) < 9:
         return ml[-1], ml[-1], 0
     sl = ema_series(ml, 9)[-1]
@@ -578,7 +709,7 @@ def calc_bb(closes, p=20):
     if len(closes) < p:
         c = closes[-1]
         return c * 1.02, c, c * 0.98
-    r = closes[-p:]
+    r   = closes[-p:]
     mid = sum(r) / p
     std = (sum((x - mid)**2 for x in r) / p) ** 0.5
     return mid + 2*std, mid, mid - 2*std
@@ -605,7 +736,7 @@ def calc_vwap(highs, lows, closes, vols, session_bars=96):
     n = min(session_bars, len(closes))
     if n == 0:
         return closes[-1] if closes else 0
-    h = highs[-n:]; l = lows[-n:]; c = closes[-n:]; v = vols[-n:]
+    h  = highs[-n:]; l = lows[-n:]; c = closes[-n:]; v = vols[-n:]
     tp = [(h[i] + l[i] + c[i]) / 3 for i in range(n)]
     tv = sum(t * vol for t, vol in zip(tp, v))
     sv = sum(v)
@@ -619,13 +750,28 @@ def safe_extract_ohlcv(cdata):
         lows   = [float(x[3]) for x in cdata]
         closes = [float(x[4]) for x in cdata]
         opens  = [float(x[1]) for x in cdata]
-        vols   = []
-        for row in cdata:
+        raw_vols  = []
+        bad_indices = []
+        for i, row in enumerate(cdata):
             try:
                 v = float(row[5])
-                vols.append(v if v > 0 else 1.0)
-            except:
-                vols.append(1.0)
+                if v > 0:
+                    raw_vols.append(v)
+                else:
+                    raw_vols.append(None)
+                    bad_indices.append(i)
+            except Exception:
+                raw_vols.append(None)
+                bad_indices.append(i)
+        good_vols = [v for v in raw_vols if v is not None]
+        if good_vols:
+            sorted_vols = sorted(good_vols)
+            median_vol  = sorted_vols[len(sorted_vols) // 2]
+        else:
+            median_vol = 1.0
+        vols = [median_vol if v is None else v for v in raw_vols]
+        if bad_indices and len(bad_indices) > len(cdata) * 0.3:
+            log.warning(f"[DATA] {len(bad_indices)}/{len(cdata)} candles had bad volume — using median fallback")
         return opens, highs, lows, closes, vols
     except Exception as e:
         log.error(f"[DATA] OHLCV parse failed: {e}")
@@ -636,9 +782,9 @@ def safe_extract_ohlcv(cdata):
 
 def mtf_analysis(symbol, primary_15m=None):
     bull, bear = 0, 0
-    results = {}
-    start = time.time()
-    MAX_TIME = 15
+    results    = {}
+    start      = time.time()
+    MAX_TIME   = 15
     for gran, label, w in [("5","5m",1),("15","15m",2),("60","1H",3),("240","4H",4)]:
         if time.time() - start > MAX_TIME:
             log.warning(f"[MTF] Timeout — skipping {label}")
@@ -657,22 +803,22 @@ def mtf_analysis(symbol, primary_15m=None):
                 results[label] = "⚪"
                 continue
             e9, e21 = ema(cls, 9), ema(cls, 21)
-            r = calc_rsi(cls)
+            r       = calc_rsi(cls)
             _, _, mh = calc_macd(cls)
             bbu, _, bbl = calc_bb(cls)
-            sk = calc_stoch(hhs, lls, cls)
-            tb, tr = 0, 0
+            sk      = calc_stoch(hhs, lls, cls)
+            tb, tr  = 0, 0
             if e9 > e21: tb += 2
-            else: tr += 2
-            if r < 35: tb += 2
+            else:        tr += 2
+            if r < 35:   tb += 2
             elif r > 65: tr += 2
             elif r > 50: tb += 1
-            else: tr += 1
+            else:        tr += 1
             if mh > 0: tb += 1
-            else: tr += 1
+            else:      tr += 1
             if cls[-1] <= bbl: tb += 1
             elif cls[-1] >= bbu: tr += 1
-            if sk < 25: tb += 1
+            if sk < 25:  tb += 1
             elif sk > 75: tr += 1
             bull += tb * w
             bear += tr * w
@@ -683,114 +829,668 @@ def mtf_analysis(symbol, primary_15m=None):
     return bull, bear, results
 
 
-# ── Pattern Memory (Self-Learning) ────────────────────────────
-# Bot tracks win/loss for each unique setup signature.
-# Over time, learns which setups work and which don't.
+# ── Mini-Backtest (Pre-Trade Validation) ──────────────────────
 
-PATTERN_MIN_SAMPLES = 5      # Need 5+ trades before pattern is "mature"
-PATTERN_MIN_WIN_RATE = 0.35  # Skip setups with <35% historical win rate
+MINI_BT_LOOKBACK    = 300
+MINI_BT_FORWARD     = 20
+MINI_BT_MIN_SAMPLES = 3
+MINI_BT_MIN_WR      = 0.40
+
+def mini_backtest_signal(candles, action, atr, sig=None, sl_mult=SL_MULT, tp_mult=TP2_MULT):
+    """Scan past candles for similar setups and check historical win rate.
+    Returns: (win_rate, num_samples, reason_str)
+    """
+    if action not in ("LONG", "SHORT"):
+        return None, 0, f"invalid action ({action})"
+    if len(candles) < 100:
+        return None, 0, "insufficient candles"
+    if atr is None or atr <= 0:
+        return None, 0, f"invalid ATR ({atr})"
+
+    _, highs, lows, closes, _ = safe_extract_ohlcv(candles)
+    if len(closes) < 100:
+        return None, 0, "OHLCV parse failed"
+
+    if sig is not None:
+        sig_rsi   = sig.get("rsi", 50)
+        sig_mh    = sig.get("macd_h", 0)
+        sig_stoch = sig.get("stoch", 50)
+        rsi_lo, rsi_hi     = sig_rsi - 10, sig_rsi + 10
+        stoch_lo, stoch_hi = sig_stoch - 10, sig_stoch + 10
+        macd_positive      = sig_mh > 0
+    else:
+        if action == "LONG":
+            rsi_lo, rsi_hi     = 0, 45
+            stoch_lo, stoch_hi = 0, 40
+            macd_positive      = True
+        else:
+            rsi_lo, rsi_hi     = 55, 100
+            stoch_lo, stoch_hi = 60, 100
+            macd_positive      = False
+
+    scan_end       = len(closes) - MINI_BT_FORWARD
+    scan_start     = max(50, scan_end - MINI_BT_LOOKBACK)
+    actual_lookback = scan_end - scan_start
+    wins = losses = ambiguous = 0
+
+    for i in range(scan_start, scan_end):
+        window_closes = closes[:i+1]
+        window_highs  = highs[:i+1]
+        window_lows   = lows[:i+1]
+        if len(window_closes) < 50:
+            continue
+        try:
+            r  = calc_rsi(window_closes)
+            _, _, mh = calc_macd(window_closes)
+            sk = calc_stoch(window_highs, window_lows, window_closes)
+            e9  = ema(window_closes, 9)
+            e21 = ema(window_closes, 21)
+        except Exception:
+            continue
+
+        macd_match = (mh > 0) == macd_positive
+        ema_match  = (e9 > e21) if action == "LONG" else (e9 < e21)
+        if not (rsi_lo <= r <= rsi_hi and stoch_lo <= sk <= stoch_hi
+                and macd_match and ema_match):
+            continue
+
+        entry        = closes[i]
+        future_highs = highs[i+1:i+1+MINI_BT_FORWARD]
+        future_lows  = lows[i+1:i+1+MINI_BT_FORWARD]
+        if not future_highs or not future_lows:
+            continue
+
+        if action == "LONG":
+            target = entry + atr * tp_mult
+            stop   = entry - atr * sl_mult
+        else:
+            target = entry - atr * tp_mult
+            stop   = entry + atr * sl_mult
+
+        hit_target = hit_stop = False
+        for j in range(len(future_highs)):
+            if action == "LONG":
+                sl_hit = future_lows[j] <= stop
+                tp_hit = future_highs[j] >= target
+            else:
+                sl_hit = future_highs[j] >= stop
+                tp_hit = future_lows[j] <= target
+
+            if sl_hit and tp_hit:
+                hit_stop = True
+                ambiguous += 1
+                break
+            elif sl_hit:
+                hit_stop = True
+                break
+            elif tp_hit:
+                hit_target = True
+                break
+
+        if hit_target:
+            wins += 1
+        elif hit_stop:
+            losses += 1
+
+    total = wins + losses
+    if total == 0:
+        return None, 0, "no similar setups found"
+
+    wr      = wins / total
+    amb_str = f", {ambiguous} ambig" if ambiguous > 0 else ""
+    reason  = f"{wins}W/{losses}L ({wr*100:.0f}%) in {actual_lookback}c{amb_str}"
+    return wr, total, reason
+
+
+def check_mini_backtest(candles, action, atr, sig=None):
+    wr, samples, reason = mini_backtest_signal(candles, action, atr, sig=sig)
+    if wr is None:
+        return True, reason
+    if samples < MINI_BT_MIN_SAMPLES:
+        return True, f"only {samples} samples — allowed"
+    if wr < MINI_BT_MIN_WR:
+        return False, f"{reason} < {MINI_BT_MIN_WR*100:.0f}% threshold"
+    return True, reason
+
+
+# ── Pattern Memory (Self-Learning) ────────────────────────────
+
+PATTERN_MIN_SAMPLES  = 5
+PATTERN_MIN_WIN_RATE = 0.35
+PATTERN_MAX_ENTRIES  = 200
+PATTERN_PRUNE_AFTER  = 250
+
+def _safe_num(v, default):
+    if v is None:
+        return default
+    try:
+        f = float(v)
+        if f != f:  # NaN check
+            return default
+        return f
+    except (ValueError, TypeError):
+        return default
+
 
 def get_pattern_signature(sig):
-    """
-    Create unique signature for this setup based on key features.
-    Same signature = same type of setup.
-    Granular enough to differentiate, broad enough to get samples.
-    """
-    parts = [sig["action"]]
+    if not isinstance(sig, dict):
+        return "UNKNOWN|all_default"
 
-    # RSI bucket
-    rsi = sig.get("rsi", 50)
-    if rsi < 30: parts.append("RSI_xover")
+    sym = sig.get("sym") or sig.get("asset", "ANY")
+    if not isinstance(sym, str):
+        sym = "ANY"
+
+    action = sig.get("action")
+    if not isinstance(action, str):
+        action = "UNKNOWN"
+    parts = [sym, action]
+
+    rsi = _safe_num(sig.get("rsi"), 50)
+    if rsi < 30:   parts.append("RSI_xover")
     elif rsi < 40: parts.append("RSI_low")
     elif rsi > 70: parts.append("RSI_xhigh")
     elif rsi > 60: parts.append("RSI_high")
-    else: parts.append("RSI_mid")
+    else:          parts.append("RSI_mid")
 
-    # MACD direction
-    if sig.get("macd_h", 0) > 0:
-        parts.append("MACD_pos")
-    else:
-        parts.append("MACD_neg")
+    mh = _safe_num(sig.get("macd_h"), 0)
+    parts.append("MACD_pos" if mh > 0 else "MACD_neg")
 
-    # Stoch bucket
-    stoch = sig.get("stoch", 50)
-    if stoch < 25: parts.append("Stoch_low")
+    stoch = _safe_num(sig.get("stoch"), 50)
+    if stoch < 25:   parts.append("Stoch_low")
     elif stoch > 75: parts.append("Stoch_high")
-    else: parts.append("Stoch_mid")
+    else:            parts.append("Stoch_mid")
 
-    # Volume regime
-    vol_r = sig.get("vol_r", 1)
-    if vol_r > 2: parts.append("Vol_surge")
+    vol_r = _safe_num(sig.get("vol_r"), 1)
+    if vol_r > 2:     parts.append("Vol_surge")
     elif vol_r > 1.3: parts.append("Vol_above")
-    else: parts.append("Vol_norm")
+    else:             parts.append("Vol_norm")
 
-    # Volatility bucket
-    volat = sig.get("volat", 1)
+    volat = _safe_num(sig.get("volat"), 1)
     if volat < 1.5: parts.append("Volat_low")
     elif volat < 3: parts.append("Volat_mid")
-    else: parts.append("Volat_high")
+    else:           parts.append("Volat_high")
 
-    # Confidence tier
-    conf = sig.get("conf", 65)
-    if conf >= 85: parts.append("Conf_xhigh")
+    conf = _safe_num(sig.get("conf"), 65)
+    if conf >= 85:   parts.append("Conf_xhigh")
     elif conf >= 75: parts.append("Conf_high")
-    else: parts.append("Conf_mid")
+    else:            parts.append("Conf_mid")
+
+    regime = sig.get("regime", "UNKNOWN")
+    if not isinstance(regime, str):
+        regime = "UNKNOWN"
+    parts.append(f"Reg_{regime}")
 
     return "|".join(parts)
 
 
 def check_pattern_history(sig_key):
-    """
-    Check if this pattern has been profitable historically.
-    Returns: (should_trade, reason_str)
-    """
-    pm = S.get("pattern_memory", {})
-    record = pm.get(sig_key, {"wins": 0, "losses": 0})
-    total = record["wins"] + record["losses"]
+    if not sig_key:
+        return True, "no pattern key"
 
+    pm = S.get("pattern_memory", {})
+    if not isinstance(pm, dict):
+        log.warning("[LEARN] pattern_memory corrupted (not dict), resetting")
+        S["pattern_memory"] = {}
+        return True, "memory reset"
+
+    record = pm.get(sig_key, {"wins": 0, "losses": 0})
+    try:
+        wins   = max(0, int(record.get("wins", 0)) if isinstance(record, dict) else 0)
+        losses = max(0, int(record.get("losses", 0)) if isinstance(record, dict) else 0)
+    except (ValueError, TypeError):
+        wins = losses = 0
+
+    total = wins + losses
     if total < PATTERN_MIN_SAMPLES:
-        # Not enough data — allow trade (bot is still learning)
         return True, f"learning ({total}/{PATTERN_MIN_SAMPLES})"
 
-    win_rate = record["wins"] / total
+    win_rate = wins / total
     if win_rate < PATTERN_MIN_WIN_RATE:
-        return False, f"WR {win_rate*100:.0f}% < {PATTERN_MIN_WIN_RATE*100:.0f}% ({record['wins']}W/{record['losses']}L)"
+        return False, f"WR {win_rate*100:.0f}% < {PATTERN_MIN_WIN_RATE*100:.0f}% ({wins}W/{losses}L)"
 
-    return True, f"WR {win_rate*100:.0f}% ({record['wins']}W/{record['losses']}L)"
+    return True, f"WR {win_rate*100:.0f}% ({wins}W/{losses}L)"
 
 
 def update_pattern_memory(sig_key, won):
-    """Update pattern memory after trade closes."""
-    if "pattern_memory" not in S:
+    if not sig_key or not isinstance(sig_key, str):
+        return
+    if sig_key.startswith("UNKNOWN|"):
+        log.debug("[LEARN] Skipping UNKNOWN pattern key — not recording")
+        return
+    if won is None:
+        return
+
+    if "pattern_memory" not in S or not isinstance(S.get("pattern_memory"), dict):
         S["pattern_memory"] = {}
+
     if sig_key not in S["pattern_memory"]:
         S["pattern_memory"][sig_key] = {"wins": 0, "losses": 0}
+
+    rec = S["pattern_memory"][sig_key]
+    if not isinstance(rec, dict):
+        rec = {"wins": 0, "losses": 0}
+    rec.setdefault("wins", 0)
+    rec.setdefault("losses", 0)
+
     if won:
-        S["pattern_memory"][sig_key]["wins"] += 1
+        rec["wins"] += 1
     else:
-        S["pattern_memory"][sig_key]["losses"] += 1
+        rec["losses"] += 1
+    S["pattern_memory"][sig_key] = rec
+
+    if len(S["pattern_memory"]) > PATTERN_PRUNE_AFTER:
+        prune_pattern_memory(protect=sig_key)
+
+
+def prune_pattern_memory(protect=None):
+    pm = S.get("pattern_memory", {})
+    if not isinstance(pm, dict):
+        S["pattern_memory"] = {}
+        return
+    if len(pm) <= PATTERN_MAX_ENTRIES:
+        return
+
+    def sample_count(item):
+        _, rec = item
+        if not isinstance(rec, dict):
+            return -1
+        try:
+            return int(rec.get("wins", 0)) + int(rec.get("losses", 0))
+        except (ValueError, TypeError):
+            return -1
+
+    sorted_pats = sorted(pm.items(), key=sample_count, reverse=True)
+    keep        = dict(sorted_pats[:PATTERN_MAX_ENTRIES])
+
+    if protect and protect in pm and protect not in keep:
+        if keep:
+            min_key = min(keep.keys(), key=lambda k: sample_count((k, keep[k])))
+            del keep[min_key]
+        keep[protect] = pm[protect]
+
+    pruned_count = len(pm) - len(keep)
+    S["pattern_memory"] = keep
+    if pruned_count > 0:
+        log.info(f"[LEARN] Pruned {pruned_count} stale patterns "
+                 f"(kept top {len(keep)} by sample count)")
 
 
 def print_pattern_summary():
-    """Print summary of learned patterns."""
     pm = S.get("pattern_memory", {})
     if not pm:
         return
     log.info("─── PATTERN MEMORY ───")
-    # Sort by total trades
-    sorted_pats = sorted(pm.items(),
-                         key=lambda x: x[1]["wins"] + x[1]["losses"],
-                         reverse=True)
-    for key, rec in sorted_pats[:10]:  # Top 10 most common
-        total = rec["wins"] + rec["losses"]
-        wr = rec["wins"] / total * 100 if total > 0 else 0
+
+    def safe_total(item):
+        _, rec = item
+        if not isinstance(rec, dict):
+            return 0
+        try:
+            return int(rec.get("wins", 0)) + int(rec.get("losses", 0))
+        except (ValueError, TypeError):
+            return 0
+
+    sorted_pats = sorted(pm.items(), key=safe_total, reverse=True)
+    for key, rec in sorted_pats[:10]:
+        if not isinstance(rec, dict):
+            continue
+        try:
+            wins   = int(rec.get("wins", 0))
+            losses = int(rec.get("losses", 0))
+        except (ValueError, TypeError):
+            continue
+        total = wins + losses
+        if total == 0:
+            continue
+        wr     = wins / total * 100
         status = "✅" if wr >= 50 else "⚠️" if wr >= 35 else "❌"
-        log.info(f"  {status} {key} → {wr:.0f}% ({rec['wins']}W/{rec['losses']}L)")
+        log.info(f"  {status} {key} → {wr:.0f}% ({wins}W/{losses}L)")
+
+
+# ── Circuit Breakers ──────────────────────────────────────────
+
+API_FAIL_COUNT  = 0
+OUTAGE_DETECTED = False
+
+def record_trade_outcome(pnl):
+    now_ms = int(time.time() * 1000)
+    if "recent_pnl_log" not in S or not isinstance(S["recent_pnl_log"], list):
+        S["recent_pnl_log"] = []
+    S["recent_pnl_log"].append([now_ms, pnl])
+    if len(S["recent_pnl_log"]) > 100:
+        S["recent_pnl_log"] = S["recent_pnl_log"][-100:]
+
+
+def process_cb_expiry():
+    now_ms      = int(time.time() * 1000)
+    pause_until = S.get("cb_paused_until", 0)
+    if pause_until and now_ms >= pause_until:
+        log.info("[CB] Pause expired — resetting loss_streak and pnl_log")
+        S["cb_paused_until"] = 0
+        S["cb_reason"]       = ""
+        S["loss_streak"]     = 0
+        one_hour_ago = now_ms - 3600000
+        S["recent_pnl_log"] = [
+            [ts, pnl] for ts, pnl in S.get("recent_pnl_log", [])
+            if ts >= one_hour_ago
+        ]
+        save_state()
+        notify("✅ Circuit breaker pause expired — trading resumed", urgent=True)
+        return True
+    return False
+
+
+def check_circuit_breakers(balance):
+    """Pure query — no side effects. Call process_cb_expiry() separately each cycle."""
+    now_ms      = int(time.time() * 1000)
+    pause_until = S.get("cb_paused_until", 0)
+    if pause_until and now_ms < pause_until:
+        remaining = (pause_until - now_ms) // 1000
+        return True, f"paused {remaining}s more ({S.get('cb_reason', 'unknown')})"
+
+    # FIX A: removed dead unreachable second return that was here
+
+    if S.get("loss_streak", 0) >= CB_CONSECUTIVE_LOSSES:
+        return True, f"{CB_CONSECUTIVE_LOSSES} consecutive losses"
+
+    if balance > 0 and isinstance(S.get("recent_pnl_log"), list):
+        one_hour_ago = now_ms - 3600000
+        recent       = [pnl for ts, pnl in S["recent_pnl_log"] if ts >= one_hour_ago]
+        hourly_pnl   = sum(recent)
+        if hourly_pnl < 0 and abs(hourly_pnl) / balance > CB_HOURLY_LOSS_PCT:
+            return True, f"hourly loss {abs(hourly_pnl)/balance*100:.1f}% > {CB_HOURLY_LOSS_PCT*100:.0f}%"
+
+    if API_FAIL_COUNT >= CB_CONSECUTIVE_API_FAILS:
+        return True, f"{API_FAIL_COUNT} consecutive API failures"
+
+    return False, "ok"
+
+
+def trip_circuit_breaker(reason):
+    now_ms = int(time.time() * 1000)
+    S["cb_paused_until"] = now_ms + (CB_PAUSE_DURATION * 1000)
+    S["cb_reason"]       = reason
+    log.error(f"⛔ CIRCUIT BREAKER TRIPPED: {reason}")
+    log.error(f"   Bot paused for {CB_PAUSE_DURATION}s ({CB_PAUSE_DURATION//60}min)")
+    notify(f"⛔ Circuit Breaker: {reason}\nPaused {CB_PAUSE_DURATION//60}min", urgent=True)
+    save_state()
+
+
+# ── Exchange Outage Protection ────────────────────────────────
+
+def check_exchange_health():
+    try:
+        r = requests.get(f"{BASE_URL}/api/v2/public/time", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("code") == "00000"
+    except Exception:
+        pass
+    return False
+
+
+def wait_for_exchange_recovery(max_wait_seconds=86400):
+    global OUTAGE_DETECTED
+    if not OUTAGE_DETECTED:
+        return
+    log.warning("[OUTAGE] Bitget unreachable — waiting for recovery...")
+    notify("⚠️ Bitget API down — bot paused", urgent=True)
+    attempts    = 0
+    max_attempts = max_wait_seconds // OUTAGE_RETRY_INTERVAL
+    while OUTAGE_DETECTED and attempts < max_attempts:
+        time.sleep(OUTAGE_RETRY_INTERVAL)
+        attempts += 1
+        if check_exchange_health():
+            OUTAGE_DETECTED = False
+            log.info(f"[OUTAGE] ✅ Bitget recovered after {attempts*OUTAGE_RETRY_INTERVAL}s")
+            notify(f"✅ Bitget recovered after {attempts}min", urgent=True)
+            return
+        if attempts % 10 == 0:
+            log.warning(f"[OUTAGE] Still down (attempt {attempts}, "
+                        f"{attempts*OUTAGE_RETRY_INTERVAL/60:.0f}min elapsed)")
+    if OUTAGE_DETECTED:
+        log.error(f"[OUTAGE] Max wait ({max_wait_seconds/3600:.0f}h) reached — "
+                  f"exchange still down.")
+        notify(f"🚨 Bitget down >{max_wait_seconds//3600}h — check exchange manually!", urgent=True)
+
+
+def register_api_failure():
+    global API_FAIL_COUNT
+    API_FAIL_COUNT += 1
+
+def register_api_success():
+    global API_FAIL_COUNT
+    API_FAIL_COUNT = 0
+
+
+# ── Correlation-Aware Sizing ──────────────────────────────────
+
+CORRELATED_GROUPS = [
+    {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"},
+]
+
+def is_correlated_with_open(sym, new_side=None):
+    open_meta = S.get("trade_meta", {})
+    if not open_meta:
+        return False
+    for group in CORRELATED_GROUPS:
+        if sym in group:
+            others = group - {sym}
+            for open_sym in open_meta:
+                if open_sym not in others:
+                    continue
+                if new_side is None:
+                    return True
+                if open_meta[open_sym].get("side", "") == new_side:
+                    return True
+    return False
+
+
+# ── Slippage Model ────────────────────────────────────────────
+
+def estimate_slippage(volat_pct):
+    if volat_pct < 2:
+        bps = SLIPPAGE_BPS_LOW
+    elif volat_pct < 4:
+        bps = (SLIPPAGE_BPS_LOW + SLIPPAGE_BPS_HIGH) / 2
+    else:
+        bps = SLIPPAGE_BPS_HIGH
+    return bps / 10000
+
+def adjust_for_slippage(price, volat_pct, action):
+    slip = estimate_slippage(volat_pct)
+    return price * (1 + slip) if action == "LONG" else price * (1 - slip)
+
+
+# ── Regime Classifier ─────────────────────────────────────────
+
+def calc_adx(highs, lows, closes, period=14):
+    if len(closes) < 2 * period + 1:
+        return 0
+    tr_list  = []
+    plus_dm  = []
+    minus_dm = []
+    for i in range(1, len(closes)):
+        high_diff = highs[i] - highs[i-1]
+        low_diff  = lows[i-1] - lows[i]
+        plus_dm.append(max(high_diff, 0) if high_diff > low_diff else 0)
+        minus_dm.append(max(low_diff, 0) if low_diff > high_diff else 0)
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i-1]),
+                 abs(lows[i] - closes[i-1]))
+        tr_list.append(tr)
+
+    smoothed_tr    = sum(tr_list[:period])
+    smoothed_plus  = sum(plus_dm[:period])
+    smoothed_minus = sum(minus_dm[:period])
+    dx_values      = []
+
+    for i in range(period, len(tr_list)):
+        smoothed_tr    = smoothed_tr    - (smoothed_tr    / period) + tr_list[i]
+        smoothed_plus  = smoothed_plus  - (smoothed_plus  / period) + plus_dm[i]
+        smoothed_minus = smoothed_minus - (smoothed_minus / period) + minus_dm[i]
+        if smoothed_tr == 0:
+            continue
+        plus_di  = 100 * smoothed_plus  / smoothed_tr
+        minus_di = 100 * smoothed_minus / smoothed_tr
+        di_sum   = plus_di + minus_di
+        dx_values.append(0 if di_sum == 0 else 100 * abs(plus_di - minus_di) / di_sum)
+
+    if len(dx_values) < period:
+        return 0
+    adx = sum(dx_values[:period]) / period
+    for i in range(period, len(dx_values)):
+        adx = (adx * (period - 1) + dx_values[i]) / period
+    return adx
+
+
+def classify_regime(highs, lows, closes, volat_pct):
+    if volat_pct > REGIME_VOLAT_HIGH:
+        return "VOLATILE"
+    recent_window = 50
+    h   = highs[-recent_window:]  if len(highs)   >= recent_window else highs
+    l   = lows[-recent_window:]   if len(lows)    >= recent_window else lows
+    c   = closes[-recent_window:] if len(closes)  >= recent_window else closes
+    adx = calc_adx(h, l, c)
+    if adx > REGIME_ADX_TREND:
+        recent = closes[-10:]
+        if recent[-1] > recent[0] * 1.005:
+            return "TRENDING_UP"
+        elif recent[-1] < recent[0] * 0.995:
+            return "TRENDING_DOWN"
+    return "RANGING"
+
+
+def regime_adjustment(regime, action):
+    if regime == "VOLATILE":
+        return 0.7
+    if regime == "RANGING":
+        return 1.0
+    if regime == "TRENDING_UP":
+        return 1.15 if action == "LONG" else 0.6
+    if regime == "TRENDING_DOWN":
+        return 1.15 if action == "SHORT" else 0.6
+    return 1.0
+
+
+# ── Shadow Mode ───────────────────────────────────────────────
+
+def log_shadow_trade(sym, sig, size, margin):
+    if "shadow_trades" not in S or not isinstance(S["shadow_trades"], list):
+        S["shadow_trades"] = []
+    entry = {
+        "ts":      int(time.time() * 1000),
+        "ts_iso":  datetime.now(timezone.utc).isoformat(),
+        "sym":     sym,
+        "action":  sig.get("action"),
+        "price":   sig.get("price"),
+        "conf":    sig.get("conf"),
+        "sl":      sig.get("sl"),
+        "tp1":     sig.get("tp1"),
+        "tp2":     sig.get("tp2"),
+        "tp3":     sig.get("tp3"),
+        "lev":     sig.get("lev"),
+        "size":    size,
+        "margin":  margin,
+        "regime":  sig.get("regime", "unknown"),
+        "rsi":     sig.get("rsi"),
+        "macd_h":  sig.get("macd_h"),
+        "stoch":   sig.get("stoch"),
+        "vol_r":   sig.get("vol_r"),
+        "volat":   sig.get("volat"),
+        "bull":    sig.get("bull"),
+        "bear":    sig.get("bear"),
+        "atr":     sig.get("atr"),
+        "reasons": sig.get("reasons", []),
+        "outcome": None,
+    }
+    S["shadow_trades"].append(entry)
+    if len(S["shadow_trades"]) > 200:
+        S["shadow_trades"] = S["shadow_trades"][-200:]
+    log.info(f"[SHADOW] 👻 Would trade {sym} {sig['action']} @ ${sig['price']:.2f} "
+             f"(size={size}, margin=${margin}, conf={sig.get('conf')}%, regime={sig.get('regime')})")
+
+
+def print_shadow_summary():
+    shadow = S.get("shadow_trades", [])
+    if not shadow:
+        return
+    log.info("─── SHADOW MODE STATS ───")
+    log.info(f"  Total shadow trades: {len(shadow)}")
+    longs  = sum(1 for t in shadow if t.get("action") == "LONG")
+    shorts = sum(1 for t in shadow if t.get("action") == "SHORT")
+    log.info(f"  LONG: {longs}, SHORT: {shorts}")
+    regimes = {}
+    for t in shadow[-50:]:
+        r = t.get("regime", "?")
+        regimes[r] = regimes.get(r, 0) + 1
+    log.info(f"  Recent regimes: {regimes}")
+    with_outcomes = [t for t in shadow if t.get("outcome")]
+    if with_outcomes:
+        wins    = sum(1 for t in with_outcomes if t["outcome"].get("hit") == "tp")
+        losses  = sum(1 for t in with_outcomes if t["outcome"].get("hit") == "sl")
+        timeout = sum(1 for t in with_outcomes if t["outcome"].get("hit") == "timeout")
+        log.info(f"  Outcomes: {wins} TP / {losses} SL / {timeout} timeout "
+                 f"(of {len(with_outcomes)} resolved)")
+
+
+def update_shadow_outcomes():
+    shadow = S.get("shadow_trades", [])
+    if not shadow:
+        return
+    now_ms     = int(time.time() * 1000)
+    unresolved = [t for t in shadow if t.get("outcome") is None]
+
+    for trade in unresolved:
+        age_ms    = now_ms - trade.get("ts", now_ms)
+        age_hours = age_ms / 3600000
+        sym       = trade.get("sym")
+        if not sym:
+            continue
+        tick = pub_ticker(sym)
+        if not tick:
+            continue
+        try:
+            cur_price = float(tick.get("lastPr", 0))
+        except (ValueError, TypeError):
+            continue
+        if cur_price <= 0:
+            continue
+
+        entry  = trade.get("price", 0)
+        sl     = trade.get("sl", 0)
+        tp1    = trade.get("tp1", 0)
+        action = trade.get("action")
+        if entry <= 0 or sl <= 0:
+            continue
+
+        hit = None
+        if action == "LONG":
+            if cur_price <= sl:   hit = "sl"
+            elif cur_price >= tp1: hit = "tp"
+        elif action == "SHORT":
+            if cur_price >= sl:   hit = "sl"
+            elif cur_price <= tp1: hit = "tp"
+
+        if hit is None and age_hours >= 24:
+            hit = "timeout"
+
+        if hit:
+            pct = ((cur_price - entry) / entry * 100 if action == "LONG"
+                   else (entry - cur_price) / entry * 100)
+            trade["outcome"] = {
+                "hit":         hit,
+                "exit_price":  cur_price,
+                "pct_move":    pct,
+                "hold_hours":  age_hours,
+                "resolved_ts": now_ms,
+            }
+            log.info(f"[SHADOW] 📊 Resolved {sym} {action} @ ${entry:.2f} → ${cur_price:.2f} "
+                     f"({pct:+.2f}%) hit={hit} held={age_hours:.1f}h")
 
 
 # ── Compounding ───────────────────────────────────────────────
 
-def compound_size(bal, price, lev, conf, sym):
+def compound_size(bal, price, lev, conf, sym, side=None):
     margin = bal * COMPOUND_PCT
     if S["loss_streak"] >= 3:
         margin *= 0.5
@@ -801,7 +1501,7 @@ def compound_size(bal, price, lev, conf, sym):
         margin *= 1.15
     elif S["win_streak"] >= 2:
         margin *= 1.08
-    if conf >= 90: margin *= 1.2
+    if conf >= 90:   margin *= 1.2
     elif conf >= 85: margin *= 1.1
     elif conf >= 80: margin *= 1.05
     if S["peak_bal"] > 0:
@@ -811,21 +1511,25 @@ def compound_size(bal, price, lev, conf, sym):
             log.warning(f"[COMPOUND] Drawdown {dd*100:.1f}% — size 40%")
         elif dd > 0.06:
             margin *= 0.7
+    if is_correlated_with_open(sym, new_side=side):
+        margin *= CORR_REDUCTION
+        log.info(f"[COMPOUND] {sym} correlated with open position — size {CORR_REDUCTION*100:.0f}%")
     margin = min(margin, bal * 0.40)
-    # FIX v6.1: Dynamic minimum margin: max($3, 8% of balance)
-    # Scales with balance — small accounts can still trade, large accounts have proper floor
     dynamic_min = max(3.0, bal * 0.08)
-    if bal >= dynamic_min:
-        if margin < dynamic_min:
-            log.warning(f"[COMPOUND] {sym} margin ${margin:.2f} < ${dynamic_min:.2f} "
-                        f"(dynamic min) — skip")
-            return 0, 0
-    margin = min(margin, bal * 0.95)  # Always cap at 95% of balance for fees safety
-    spec = SYMBOL_SPECS.get(sym, {"min_size": 0.0001, "precision": 4})
+    if bal < dynamic_min:
+        log.warning(f"[COMPOUND] {sym} balance ${bal:.2f} < min ${dynamic_min:.2f} — skip")
+        return 0, 0
+    if margin < dynamic_min:
+        log.warning(f"[COMPOUND] {sym} margin ${margin:.2f} < ${dynamic_min:.2f} "
+                    f"(dynamic min) — skip")
+        return 0, 0
+    if sym not in SYMBOL_SPECS:
+        log.error(f"[COMPOUND] Unknown symbol {sym} — no specs defined, skip")
+        return 0, 0
+    spec     = SYMBOL_SPECS[sym]
     raw_size = (margin * lev) / price
-    # Use FLOOR (not round) to never exceed available margin
-    factor = 10 ** spec["precision"]
-    size = int(raw_size * factor) / factor
+    factor   = 10 ** spec["precision"]
+    size     = int(raw_size * factor) / factor
     if size < spec["min_size"]:
         log.warning(f"[COMPOUND] {sym} size {size} < min {spec['min_size']}")
         return 0, 0
@@ -837,6 +1541,16 @@ def compound_size(bal, price, lev, conf, sym):
 def generate_signal(sym, tick, cdata, fund_rate):
     if not cdata or len(cdata) < 60:
         return None
+    try:
+        last_ts_ms = int(cdata[-1][0])
+        now_ms     = int(time.time() * 1000)
+        age_min    = (now_ms - last_ts_ms) / 60000
+        if age_min > 30:
+            log.warning(f"[{sym}] Stale candles (age {age_min:.0f}min) — skip signal")
+            return None
+    except (ValueError, TypeError, IndexError):
+        log.warning(f"[{sym}] Cannot parse candle timestamp — skip signal")
+        return None
     _, highs, lows, closes, vols = safe_extract_ohlcv(cdata)
     if not closes:
         return None
@@ -844,11 +1558,11 @@ def generate_signal(sym, tick, cdata, fund_rate):
     h24   = float(tick.get("high24h", price))
     l24   = float(tick.get("low24h", price))
     chg   = float(tick.get("change24h", 0)) * 100
-    e9   = ema(closes, 9)
-    e21  = ema(closes, 21)
-    e50  = ema(closes, 50)
-    e100 = ema(closes, 100)
-    e200 = ema(closes, 200) if len(closes) >= 200 else None
+    e9    = ema(closes, 9)
+    e21   = ema(closes, 21)
+    e50   = ema(closes, 50)
+    e100  = ema(closes, 100)
+    e200  = ema(closes, 200) if len(closes) >= 200 else None
     r_now  = calc_rsi(closes)
     r_prev = calc_rsi(closes[:-3])
     ml, ms, mh = calc_macd(closes)
@@ -859,12 +1573,14 @@ def generate_signal(sym, tick, cdata, fund_rate):
     vol_avg = sum(vols[-20:]) / 20 if len(vols) >= 20 else vols[-1]
     vol_r   = vols[-1] / vol_avg if vol_avg > 0 else 1
     volat   = (atr_v / price) * 100
-    mtf_b, mtf_br, tf_map = mtf_analysis(sym, primary_15m=cdata)
     if volat > MAX_VOLAT:
         log.warning(f"[{sym}] Volatility {volat:.1f}% — skip")
         return None
+    regime = classify_regime(highs, lows, closes, volat)
+    log.info(f"[REGIME] {sym} → {regime} (volat={volat:.1f}%, ADX-based)")
+    mtf_b, mtf_br, tf_map = mtf_analysis(sym, primary_15m=cdata)
     bull, bear = 0, 0
-    reasons = []
+    reasons    = []
     if e9 > e21 > e50 > e100:
         bull += 5; reasons.append("✅ Full EMA stack bullish")
     elif e9 > e21 > e50:
@@ -878,12 +1594,10 @@ def generate_signal(sym, tick, cdata, fund_rate):
     elif e9 < e21:
         bear += 2; reasons.append("🔴 EMA bearish 9<21")
     if e200 is not None:
-        if price > e200:
-            bull += 3; reasons.append("✅ Above EMA200")
-        else:
-            bear += 3; reasons.append("🔴 Below EMA200")
+        if price > e200: bull += 3; reasons.append("✅ Above EMA200")
+        else:            bear += 3; reasons.append("🔴 Below EMA200")
     rsi_up = r_now > r_prev
-    if r_now < 25: bull += 4; reasons.append(f"✅ RSI extreme oversold {r_now:.0f}")
+    if r_now < 25:   bull += 4; reasons.append(f"✅ RSI extreme oversold {r_now:.0f}")
     elif r_now < 35: bull += 3; reasons.append(f"✅ RSI oversold {r_now:.0f}")
     elif r_now < 45 and rsi_up: bull += 2; reasons.append(f"✅ RSI recovering {r_now:.0f}")
     elif r_now > 75: bear += 4; reasons.append(f"🔴 RSI extreme overbought {r_now:.0f}")
@@ -901,12 +1615,12 @@ def generate_signal(sym, tick, cdata, fund_rate):
         bear += 2; reasons.append("🔴 MACD bearish cross")
     elif mh < 0: bear += 1
     bb_range = bbu - bbl
-    bb_pct = (price - bbl) / bb_range if bb_range > 0 else 0.5
-    if price < bbl: bull += 3; reasons.append("✅ Below BB lower")
-    elif bb_pct < 0.2: bull += 2; reasons.append("✅ Near BB lower support")
-    elif price > bbu: bear += 3; reasons.append("🔴 Above BB upper")
-    elif bb_pct > 0.8: bear += 2; reasons.append("🔴 Near BB upper resistance")
-    if sk < 15: bull += 3; reasons.append(f"✅ Stoch extreme oversold {sk:.0f}")
+    bb_pct   = (price - bbl) / bb_range if bb_range > 0 else 0.5
+    if price < bbl:     bull += 3; reasons.append("✅ Below BB lower")
+    elif bb_pct < 0.2:  bull += 2; reasons.append("✅ Near BB lower support")
+    elif price > bbu:   bear += 3; reasons.append("🔴 Above BB upper")
+    elif bb_pct > 0.8:  bear += 2; reasons.append("🔴 Near BB upper resistance")
+    if sk < 15:   bull += 3; reasons.append(f"✅ Stoch extreme oversold {sk:.0f}")
     elif sk < 25: bull += 2; reasons.append(f"✅ Stoch oversold {sk:.0f}")
     elif sk > 85: bear += 3; reasons.append(f"🔴 Stoch extreme overbought {sk:.0f}")
     elif sk > 75: bear += 2; reasons.append(f"🔴 Stoch overbought {sk:.0f}")
@@ -922,16 +1636,14 @@ def generate_signal(sym, tick, cdata, fund_rate):
         bear += 2; reasons.append(f"🔴 Vol surge bearish {vol_r:.1f}x")
     if fund_rate > 0.003:
         bear += 3; reasons.append(f"🔴 Extreme funding {fund_rate*100:.3f}%")
-    elif fund_rate > 0.001:
-        bear += 2
+    elif fund_rate > 0.001: bear += 2
     elif fund_rate < -0.003:
         bull += 3; reasons.append(f"✅ Extreme negative funding {fund_rate*100:.3f}%")
-    elif fund_rate < -0.001:
-        bull += 2
+    elif fund_rate < -0.001: bull += 2
     rng = h24 - l24
     if rng > 0:
         pos = (price - l24) / rng
-        if pos < 0.10: bull += 3; reasons.append("✅ At 24h low support")
+        if pos < 0.10:   bull += 3; reasons.append("✅ At 24h low support")
         elif pos < 0.25: bull += 2
         elif pos > 0.90: bear += 3; reasons.append("🔴 At 24h high resistance")
         elif pos > 0.75: bear += 2
@@ -945,39 +1657,29 @@ def generate_signal(sym, tick, cdata, fund_rate):
         bear += 5; reasons.append("🔴 ALL timeframes bearish!")
     elif mtf_br > mtf_b * 1.3:
         bear += 3; reasons.append("🔴 Most TF bearish")
-    if chg > 4: bull += 2
+    if chg > 4:   bull += 2
     elif chg > 2: bull += 1
     elif chg < -4: bear += 2
     elif chg < -2: bear += 1
-    sentiment = get_sentiment()
-    fg = sentiment.get("fg_value")
+    sentiment  = get_sentiment() or {}
+    fg         = sentiment.get("fg_value")
     if fg is not None:
-        if fg <= 20:
-            bull += 4; reasons.append(f"✅ Extreme Fear {fg} — buy opportunity")
-        elif fg <= 35:
-            bull += 2; reasons.append(f"✅ Market fearful {fg}")
-        elif fg >= 80:
-            bear += 4; reasons.append(f"🔴 Extreme Greed {fg} — caution!")
-        elif fg >= 65:
-            bear += 2; reasons.append(f"🔴 Market greedy {fg}")
+        if fg <= 20:   bull += 4; reasons.append(f"✅ Extreme Fear {fg} — buy opportunity")
+        elif fg <= 35: bull += 2; reasons.append(f"✅ Market fearful {fg}")
+        elif fg >= 80: bear += 4; reasons.append(f"🔴 Extreme Greed {fg} — caution!")
+        elif fg >= 65: bear += 2; reasons.append(f"🔴 Market greedy {fg}")
     news_sent = sentiment.get("news_sent")
     if news_sent is not None:
-        if news_sent > 30:
-            bull += 3; reasons.append("✅ News very bullish")
-        elif news_sent > 10:
-            bull += 1
-        elif news_sent < -30:
-            bear += 3; reasons.append("🔴 News very bearish")
-        elif news_sent < -10:
-            bear += 1
+        if news_sent > 30:   bull += 3; reasons.append("✅ News very bullish")
+        elif news_sent > 10: bull += 1
+        elif news_sent < -30: bear += 3; reasons.append("🔴 News very bearish")
+        elif news_sent < -10: bear += 1
     if sym == "ETHUSDT":
         btc_dom = sentiment.get("btc_dom")
         if btc_dom is not None:
-            if btc_dom > 55:
-                bear += 1; reasons.append(f"🔴 BTC dominance high {btc_dom:.1f}%")
-            elif btc_dom < 45:
-                bull += 1; reasons.append(f"✅ Alt season BTC.D {btc_dom:.1f}%")
-    total = bull + bear
+            if btc_dom > 55:   bear += 1; reasons.append(f"🔴 BTC dominance high {btc_dom:.1f}%")
+            elif btc_dom < 45: bull += 1; reasons.append(f"✅ Alt season BTC.D {btc_dom:.1f}%")
+    total    = bull + bear
     if total == 0:
         return None
     bull_pct = (bull / total) * 100
@@ -997,36 +1699,60 @@ def generate_signal(sym, tick, cdata, fund_rate):
     else:
         action, side, hold = "HOLD", "none", "none"
         conf = 50
-    if volat > 5: lev = 1
+
+    regime_mult = regime_adjustment(regime, action)
+    if regime_mult != 1.0:
+        old_conf = conf
+        conf = min(97, max(0, int(conf * regime_mult)))
+        log.info(f"[REGIME] {regime}: conf {old_conf}% × {regime_mult:.2f} = {conf}%")
+    if volat > 5:    lev = 1
     elif volat > 3.5: lev = 2
     elif volat > 2.5: lev = 3
     elif volat > 1.5: lev = 4 if conf >= 80 else 3
-    elif conf >= 92: lev = min(MAX_LEVERAGE, 10)
-    elif conf >= 87: lev = min(MAX_LEVERAGE, 8)
-    elif conf >= 82: lev = min(MAX_LEVERAGE, 6)
-    elif conf >= 75: lev = min(MAX_LEVERAGE, 5)
-    else: lev = min(MAX_LEVERAGE, 3)
+    elif conf >= 92:  lev = min(MAX_LEVERAGE, 10)
+    elif conf >= 87:  lev = min(MAX_LEVERAGE, 8)
+    elif conf >= 82:  lev = min(MAX_LEVERAGE, 6)
+    elif conf >= 75:  lev = min(MAX_LEVERAGE, 5)
+    else:             lev = min(MAX_LEVERAGE, 3)
     sl_d  = atr_v * SL_MULT
     tp1_d = atr_v * TP1_MULT
     tp2_d = atr_v * TP2_MULT
     tp3_d = atr_v * TP3_MULT
     trail = atr_v * TRAIL_MULT
+
+    if action in ("LONG", "SHORT"):
+        adjusted_entry = adjust_for_slippage(price, volat, action)
+        slip_bps = abs(adjusted_entry - price) / price * 10000
+        log.info(f"[SLIPPAGE] Expected entry slippage: {slip_bps:.1f} bps")
+    else:
+        adjusted_entry = price
+
     if action == "LONG":
-        sl, tp1, tp2, tp3 = price-sl_d, price+tp1_d, price+tp2_d, price+tp3_d
+        sl, tp1, tp2, tp3 = (adjusted_entry - sl_d, adjusted_entry + tp1_d,
+                              adjusted_entry + tp2_d, adjusted_entry + tp3_d)
     elif action == "SHORT":
-        sl, tp1, tp2, tp3 = price+sl_d, price-tp1_d, price-tp2_d, price-tp3_d
+        sl, tp1, tp2, tp3 = (adjusted_entry + sl_d, adjusted_entry - tp1_d,
+                              adjusted_entry - tp2_d, adjusted_entry - tp3_d)
     else:
         sl = tp1 = tp2 = tp3 = price
+
+    if sl <= 0 or tp3 <= 0:
+        log.warning(f"[{sym}] Invalid SL/TP prices (sl=${sl}, tp3=${tp3}) — skip signal")
+        return None
+    if abs(sl - price) / price > 0.30:
+        log.warning(f"[{sym}] SL too far from price ({abs(sl-price)/price*100:.0f}%) — skip")
+        return None
     return {
-        "sym": sym, "asset": sym.replace("USDT", ""),
+        "sym":    sym, "asset": sym.replace("USDT", ""),
         "action": action, "side": side, "hold": hold,
-        "conf": conf, "price": price,
-        "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
-        "lev": lev, "rr": f"1:{round(tp2_d/sl_d,1)}",
-        "atr": atr_v, "trail": trail,
-        "rsi": r_now, "macd_h": mh, "stoch": sk,
-        "vol_r": vol_r, "volat": volat,
-        "bull": bull, "bear": bear,
+        "conf":   conf, "price": price,
+        "sl":     sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "lev":    lev, "rr": f"1:{round(tp2_d/sl_d,1)}",
+        "atr":    atr_v, "trail": trail,
+        "rsi":    r_now, "macd_h": mh, "stoch": sk,
+        "vol_r":  vol_r, "volat": volat,
+        "bull":   bull, "bear": bear,
+        "regime": regime,
         "reasons": reasons[:5],
     }
 
@@ -1034,39 +1760,53 @@ def generate_signal(sym, tick, cdata, fund_rate):
 # ── Position Management ───────────────────────────────────────
 
 def manage_position(pos):
-    sym   = pos.get("symbol")
-    hold  = pos.get("holdSide", "long")
-    mark  = float(pos.get("markPrice", 0))
-    size  = float(pos.get("total", 0))
-    entry = float(pos.get("openPriceAvg", mark))
-    pnl   = float(pos.get("unrealizedPL", 0))
+    sym  = pos.get("symbol")
+    hold = pos.get("holdSide", "long")
+    try:
+        mark  = float(pos.get("markPrice", 0))
+        size  = float(pos.get("total", 0))
+        entry = float(pos.get("openPriceAvg", mark))
+        pnl   = float(pos.get("unrealizedPL", 0))
+    except (ValueError, TypeError) as e:
+        log.warning(f"[MGR] {sym} invalid numeric data: {e} — skip")
+        return
+    if not (mark == mark and entry == entry and size == size):
+        log.warning(f"[MGR] {sym} NaN in position data — skip")
+        return
+    if mark <= 0 or entry <= 0:
+        log.warning(f"[MGR] {sym} non-positive price (mark=${mark}, entry=${entry}) — skip")
+        return
     if size <= 0:
         return
+
+    start_bal = S.get("start_bal", 0)
+    if start_bal > 0 and pnl < 0:
+        unrealized_pct = abs(pnl) / start_bal
+        if unrealized_pct > 0.05:
+            log.warning(f"[MGR] {sym} unrealized loss {unrealized_pct*100:.1f}% of start_bal — flash crash risk")
+
     meta = S["trade_meta"].get(sym, {})
     if not meta:
         log.debug(f"[MGR] {sym} no metadata — skipping")
         return
     trail = meta.get("trail", mark * 0.01)
 
-    # FIX v6.1: Better fallback for current_sl using SL_MULT/TRAIL_MULT ratio
     if "current_sl" in meta:
         current_sl = meta["current_sl"]
     else:
-        # Original SL = entry ± (SL_MULT × ATR), trail = TRAIL_MULT × ATR
-        # So sl_distance = trail × (SL_MULT / TRAIL_MULT)
         sl_distance = trail * (SL_MULT / TRAIL_MULT)
-        current_sl = (entry - sl_distance) if hold == "long" else (entry + sl_distance)
+        current_sl  = (entry - sl_distance) if hold == "long" else (entry + sl_distance)
         log.warning(f"[MGR] {sym} current_sl missing — fallback ${current_sl:,.2f}")
 
-    tp1 = meta.get("tp1", 0)
+    tp1    = meta.get("tp1", 0)
     margin = meta.get("margin", 1)
     pnl_pct = (pnl / margin) * 100 if margin else 0
     log.info(f"[MGR] {sym} {hold.upper()} Mark:${mark:,.2f} "
              f"PnL:{pnl:+.4f}({pnl_pct:+.1f}%) SL:${current_sl:,.2f}")
+
     if hold == "long":
         new_sl = mark - trail
         if new_sl > current_sl and mark > entry * 1.005:
-            # FIX v6.1: Only update if improvement is meaningful (reduces API spam)
             sl_improvement = (new_sl - current_sl) / current_sl if current_sl > 0 else 1
             if sl_improvement >= MIN_SL_IMPROVE:
                 if update_sl_atomic(sym, hold, new_sl, size):
@@ -1078,14 +1818,13 @@ def manage_position(pos):
             if be > current_sl:
                 if update_sl_atomic(sym, hold, be, size):
                     meta["current_sl"] = be
-                    meta["be_moved"] = True
+                    meta["be_moved"]   = True
                     S["trade_meta"][sym] = meta
                     save_state()
                     log.info(f"[TRAIL] {sym} TP1 hit! SL → BE")
     elif hold == "short":
         new_sl = mark + trail
         if new_sl < current_sl and mark < entry * 0.995:
-            # FIX v6.1: SL improvement threshold for SHORT (lower SL = better)
             sl_improvement = (current_sl - new_sl) / current_sl if current_sl > 0 else 1
             if sl_improvement >= MIN_SL_IMPROVE:
                 if update_sl_atomic(sym, hold, new_sl, size):
@@ -1097,16 +1836,12 @@ def manage_position(pos):
             if be < current_sl:
                 if update_sl_atomic(sym, hold, be, size):
                     meta["current_sl"] = be
-                    meta["be_moved"] = True
+                    meta["be_moved"]   = True
                     S["trade_meta"][sym] = meta
                     save_state()
                     log.info(f"[TRAIL] {sym} TP1 hit! SL → BE")
 
 def detect_closed_positions(open_pos):
-    """
-    Detect positions closed on exchange. Use ACTUAL fills for accurate PnL.
-    Falls back to last_unrealized_pnl only if fills API fails.
-    """
     exchange_syms = {p.get("symbol") for p in open_pos}
     for sym in list(S["trade_meta"].keys()):
         if sym in exchange_syms:
@@ -1114,8 +1849,7 @@ def detect_closed_positions(open_pos):
         meta = S["trade_meta"][sym]
         log.info(f"[CLOSED] {sym} closed on exchange")
 
-        # FIX v6.1: Get ACTUAL realized PnL from fills API
-        actual_pnl = 0.0
+        actual_pnl  = 0.0
         fills_found = False
         try:
             entry_time_str = meta.get("entry_time", "")
@@ -1124,67 +1858,64 @@ def detect_closed_positions(open_pos):
                     entry_time_str).timestamp() * 1000)
                 fills = fetch_recent_fills(sym, 30)
                 for fill in fills:
-                    fill_time = int(fill.get("cTime", 0))
-                    if fill_time >= entry_time_ms:
-                        trade_side = fill.get("tradeSide", "").lower()
-                        if "close" in trade_side:
-                            try:
-                                actual_pnl += float(fill.get("profit", 0))
-                                fills_found = True
-                            except (ValueError, TypeError):
-                                pass
+                    fill_time  = int(fill.get("cTime", 0))
+                    trade_side = fill.get("tradeSide", "").lower()
+                    if fill_time >= entry_time_ms and "close" in trade_side:
+                        try:
+                            actual_pnl += float(fill.get("profit", 0))
+                            fills_found = True
+                        except (ValueError, TypeError):
+                            pass
         except Exception as e:
             log.warning(f"[FILL parse] {sym}: {e}")
 
-        # Fallback only if fills empty or failed
         if not fills_found:
             last_pnl = meta.get("last_unrealized_pnl", None)
             if last_pnl is None or last_pnl == 0.0:
-                # Last resort: estimate from entry/last_mark
-                entry = meta.get("entry_price", 0)
+                entry     = meta.get("entry_price", 0)
                 last_mark = meta.get("last_mark", entry)
-                size = meta.get("size", 0)
-                side = meta.get("side", "long")
+                size      = meta.get("size", 0)
+                side      = meta.get("side", "long")
                 if entry > 0 and last_mark > 0 and size > 0:
-                    if side == "long":
-                        actual_pnl = (last_mark - entry) * size
-                    else:
-                        actual_pnl = (entry - last_mark) * size
+                    actual_pnl = ((last_mark - entry) * size if side == "long"
+                                  else (entry - last_mark) * size)
             else:
                 actual_pnl = last_pnl
             log.info(f"[CLOSED] {sym} using estimated PnL (fills not found)")
         else:
             log.info(f"[CLOSED] {sym} actual realized PnL from fills")
 
-        # Win/Loss tracking
         if actual_pnl > 0.01:
-            S["wins"] += 1
+            S["wins"]       += 1
             S["win_streak"] += 1
             S["loss_streak"] = 0
             log.info(f"[WIN] {sym} +${actual_pnl:.4f}")
-            notify(f"✅ {sym} WIN ${actual_pnl:+.2f}")
-            # Pattern Memory: record win
+            notify(f"✅ {sym} WIN ${actual_pnl:+.2f}", urgent=True)
             pat_sig = meta.get("pattern_sig")
             if pat_sig:
                 update_pattern_memory(pat_sig, won=True)
                 log.info(f"[LEARN] ✅ Pattern '{pat_sig}' → WIN recorded")
         elif actual_pnl < -0.01:
-            S["losses"] += 1
+            S["losses"]      += 1
             S["loss_streak"] += 1
-            S["win_streak"] = 0
+            S["win_streak"]   = 0
             log.info(f"[LOSS] {sym} ${actual_pnl:.4f}")
-            notify(f"❌ {sym} LOSS ${actual_pnl:+.2f}")
-            # Pattern Memory: record loss
+            notify(f"❌ {sym} LOSS ${actual_pnl:+.2f}", urgent=True)
             pat_sig = meta.get("pattern_sig")
             if pat_sig:
                 update_pattern_memory(pat_sig, won=False)
                 log.info(f"[LEARN] ❌ Pattern '{pat_sig}' → LOSS recorded")
         else:
             log.info(f"[BREAKEVEN] {sym} closed @ ~$0 PnL (no streak change)")
-            notify(f"➖ {sym} closed @ breakeven")
+            notify(f"➖ {sym} closed @ breakeven", urgent=True)
 
         S["daily_pnl"] += actual_pnl
         S["total_pnl"] += actual_pnl
+        record_trade_outcome(actual_pnl)
+        if actual_pnl < 0:
+            cb_pause, cb_reason = check_circuit_breakers(S.get("start_bal", 100))
+            if cb_pause and ("consecutive" in cb_reason or "hourly" in cb_reason):
+                trip_circuit_breaker(cb_reason)
         cancel_all_plan_orders(sym)
         del S["trade_meta"][sym]
         save_state()
@@ -1193,13 +1924,13 @@ def detect_closed_positions(open_pos):
 # ── Reporting ─────────────────────────────────────────────────
 
 def print_report(bal):
-    start = S["start_bal"]
+    start  = S["start_bal"]
     growth = ((bal - start) / start * 100) if start > 0 else 0
-    dd = ((S["peak_bal"] - bal) / S["peak_bal"] * 100) if S["peak_bal"] > 0 else 0
-    total = S["wins"] + S["losses"]
-    wr = (S["wins"] / total * 100) if total > 0 else 0
+    dd     = ((S["peak_bal"] - bal) / S["peak_bal"] * 100) if S["peak_bal"] > 0 else 0
+    total  = S["wins"] + S["losses"]
+    wr     = (S["wins"] / total * 100) if total > 0 else 0
     log.info("╔══════════════════════════════════════╗")
-    log.info("║   💰 ARES v6.2 REPORT                ║")
+    log.info("║   💰 ARES v6.4 REPORT                ║")
     log.info(f"║  Balance:  ${bal:.2f}")
     log.info(f"║  Growth:   {growth:+.2f}%")
     log.info(f"║  Drawdown: {dd:.2f}%")
@@ -1207,17 +1938,27 @@ def print_report(bal):
     log.info(f"║  WinRate:  {wr:.1f}% ({S['wins']}W/{S['losses']}L)")
     pm = S.get("pattern_memory", {})
     log.info(f"║  Patterns: {len(pm)} learned")
+    cb_paused = S.get("cb_paused_until", 0)
+    if cb_paused and int(time.time() * 1000) < cb_paused:
+        remaining = (cb_paused - int(time.time() * 1000)) // 60000
+        log.info(f"║  ⛔ CB:    paused {remaining}min more")
+    shadow = S.get("shadow_trades", [])
+    if shadow:
+        log.info(f"║  Shadow:   {len(shadow)} logged trades")
     log.info("╚══════════════════════════════════════╝")
     if pm:
         print_pattern_summary()
+    if shadow:
+        print_shadow_summary()
 
 
 # ── Main Loop ─────────────────────────────────────────────────
 
 def run():
+    global OUTAGE_DETECTED
     log.info("╔══════════════════════════════════════════════════╗")
-    log.info("║  ▲ ARES ULTRA v6.2 — Self-Learning Bot           ║")
-    log.info("║  Exchange=Truth | Pattern Memory | All bugs fixed║")
+    log.info("║  ▲ ARES ULTRA v6.4 — Pro Risk Management         ║")
+    log.info("║  +Circuit Breakers +Outage Detect +Regime +Shadow║")
     log.info(f"║  Compound:{COMPOUND_PCT*100:.0f}% | MaxLev:{MAX_LEVERAGE}x | Trades:{MAX_TRADES}     ║")
     log.info("╚══════════════════════════════════════════════════╝")
     if not API_KEY or not SECRET_KEY or not PASSPHRASE:
@@ -1226,6 +1967,12 @@ def run():
     load_state()
     if RESET_STATS:
         reset_stats()
+
+    if not check_exchange_health():
+        log.error("[INIT] Bitget unreachable on startup — waiting for recovery")
+        OUTAGE_DETECTED = True
+        wait_for_exchange_recovery()
+
     bal = fetch_balance()
     if bal == 0:
         log.warning("[INIT] Balance $0 — verify API keys and futures balance")
@@ -1235,34 +1982,50 @@ def run():
         S["start_bal"] = bal
     if S["peak_bal"] == 0:
         S["peak_bal"] = bal
-    notify(f"🚀 ARES v6.0 started | Balance: ${bal:.2f}")
+    notify(f"🚀 ARES v6.4 started | Balance: ${bal:.2f}"
+           f"{' [SHADOW]' if SHADOW_MODE else ''}", urgent=True)
     cycle = 0
     while True:
         try:
             cycle += 1
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            today = datetime.now().date()
+            now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            today = datetime.now(timezone.utc).date()
             if not isinstance(S["daily_start"], type(today)):
                 S["daily_start"] = today
             if today != S["daily_start"]:
                 log.info("🔄 New day — daily PnL reset")
-                S["daily_pnl"] = 0
+                S["daily_pnl"]   = 0
                 S["daily_start"] = today
                 save_state()
             log.info(f"\n{'═'*52}")
-            log.info(f"  CYCLE {cycle} | {now}")
+            log.info(f"  CYCLE {cycle} | {now}{' [SHADOW]' if SHADOW_MODE else ''}")
             log.info(f"{'═'*52}")
+
+            if not check_exchange_health():
+                OUTAGE_DETECTED = True
+                wait_for_exchange_recovery()
+                continue
+
             bal = fetch_balance()
             if bal > S["peak_bal"]:
                 S["peak_bal"] = bal
+
+            process_cb_expiry()
+            cb_pause, cb_reason = check_circuit_breakers(bal)
+            if cb_pause:
+                log.warning(f"⛔ [CIRCUIT BREAKER] {cb_reason}")
+                save_state()
+                time.sleep(SCAN_INTERVAL)
+                continue
+
             if S["start_bal"] > 0:
                 loss_pct = S["daily_pnl"] / S["start_bal"]
                 if loss_pct <= -MAX_DAILY_LOSS:
-                    now_utc = datetime.now(timezone.utc)
+                    now_utc  = datetime.now(timezone.utc)
                     tomorrow = (now_utc + timedelta(days=1)).replace(
                         hour=0, minute=5, second=0, microsecond=0)
                     sleep_secs = int((tomorrow - now_utc).total_seconds())
-                    hours = sleep_secs // 3600
+                    hours      = sleep_secs // 3600
                     log.warning(f"⛔ Daily loss {MAX_DAILY_LOSS*100:.0f}% hit! "
                                 f"Pausing {hours}h until next day")
                     notify(f"⛔ Daily loss limit hit. Pausing {hours}h.", urgent=True)
@@ -1270,63 +2033,100 @@ def run():
                     time.sleep(sleep_secs)
                     S["daily_pnl"] = 0
                     continue
+
             total = S["wins"] + S["losses"]
-            wr = (S["wins"] / total * 100) if total > 0 else 0
+            wr    = (S["wins"] / total * 100) if total > 0 else 0
             log.info(f"[BAL] ${bal:.2f} | Day:${S['daily_pnl']:+.4f} | "
                      f"Total:${S['total_pnl']:+.4f} | "
                      f"{S['wins']}W/{S['losses']}L ({wr:.0f}%)")
+
             if bal < 6:
                 log.warning("[SKIP] Balance < $6")
                 time.sleep(SCAN_INTERVAL)
                 continue
+
             open_pos = fetch_positions()
+            if open_pos is None:
+                log.error("[POS] fetch_positions failed — skip cycle for safety")
+                time.sleep(SCAN_INTERVAL)
+                continue
+
             log.info(f"[POS] {len(open_pos)} open | "
                      f"Tracked: {list(S['trade_meta'].keys())}")
-            detect_closed_positions(open_pos)
+
+            # Update fallback PnL data BEFORE detect_closed_positions reads it
             for pos in open_pos:
                 sym = pos.get("symbol")
                 if sym in S["trade_meta"]:
-                    S["trade_meta"][sym]["last_unrealized_pnl"] = \
-                        float(pos.get("unrealizedPL", 0))
-                    S["trade_meta"][sym]["last_mark"] = \
-                        float(pos.get("markPrice", 0))
+                    try:
+                        S["trade_meta"][sym]["last_unrealized_pnl"] = float(pos.get("unrealizedPL", 0))
+                        S["trade_meta"][sym]["last_mark"]           = float(pos.get("markPrice", 0))
+                    except (ValueError, TypeError):
+                        pass
+
+            detect_closed_positions(open_pos)
+
+            if SHADOW_MODE:
+                update_shadow_outcomes()
+
+            for pos in open_pos:
                 manage_position(pos)
-            open_syms = [p.get("symbol") for p in open_pos]
+
+            # Use live trade_meta keys (updated after detect_closed)
+            open_syms = list(S["trade_meta"].keys())
+
             if cycle % 20 == 0:
                 print_report(bal)
-            if len(open_pos) >= MAX_TRADES:
-                log.info(f"[SKIP] {MAX_TRADES} trades open")
+
+            # FIX B: all_open = union of exchange + tracked positions.
+            # Used for both the MAX_TRADES gate AND the per-symbol skip check,
+            # so manual Bitget positions are always respected.
+            exchange_syms  = {p.get("symbol") for p in open_pos}
+            tracked_syms   = set(S["trade_meta"].keys())
+            all_open       = exchange_syms | tracked_syms
+            live_open_count = len(all_open)
+
+            if live_open_count >= MAX_TRADES:
+                log.info(f"[SKIP] {MAX_TRADES} trades open "
+                         f"(tracked:{len(tracked_syms)} exchange:{len(exchange_syms)})")
                 save_state()
                 time.sleep(SCAN_INTERVAL)
                 continue
+
             for sym in SYMBOLS:
-                if sym in open_syms:
+                if sym in all_open:  # FIX B: was `open_syms` (tracked-only)
                     log.info(f"[{sym}] Position open — skip")
                     continue
+
                 log.info(f"\n[SCAN] ━━━ {sym} ━━━━━━━━━━━━━━━━━━━━━━━")
-                tick  = pub_ticker(sym)
-                cdata = pub_candles(sym, "15", 150)
+                tick       = pub_ticker(sym)
+                cdata_full = pub_candles(sym, "15", 350)
                 fund_rate, fund_mins = pub_funding(sym)
-                if not tick or not cdata:
+                if not tick or not cdata_full:
                     log.warning(f"[{sym}] No market data")
                     continue
-                if fund_mins == -1 and abs(fund_rate) > 0.0003:
+                cdata = cdata_full[-150:] if len(cdata_full) >= 150 else cdata_full
+
+                if fund_mins == -1 and abs(fund_rate) > 0.0008:
                     log.warning(f"[{sym}] Funding time unknown @ "
-                                f"{fund_rate*100:.3f}% — skip")
+                                f"{fund_rate*100:.3f}% (extreme) — skip")
                     continue
                 if fund_mins != -1 and fund_mins < 15 and abs(fund_rate) > 0.0005:
                     log.warning(f"[{sym}] Funding in {fund_mins}m @ "
                                 f"{fund_rate*100:.3f}% — skip")
                     continue
-                price = float(tick.get("lastPr", 0))
-                chg   = float(tick.get("change24h", 0)) * 100
+
+                price    = float(tick.get("lastPr", 0))
+                chg      = float(tick.get("change24h", 0)) * 100
                 fund_str = f"{fund_mins}m" if fund_mins != -1 else "?"
                 log.info(f"[{sym}] ${price:,.2f} | {chg:+.2f}% | "
                          f"Fund:{fund_rate*100:.4f}% (in {fund_str})")
+
                 sig = generate_signal(sym, tick, cdata, fund_rate)
                 if not sig:
                     log.info(f"[{sym}] No signal")
                     continue
+
                 em = "🟢" if sig["action"]=="LONG" else "🔴" if sig["action"]=="SHORT" else "🟡"
                 log.info(f"[SIG] {em} {sig['action']} | Conf:{sig['conf']}% | "
                          f"Lev:{sig['lev']}x | R:R {sig['rr']}")
@@ -1335,12 +2135,22 @@ def run():
                 log.info(f"[SCR] 🟢{sig['bull']} vs 🔴{sig['bear']}")
                 for r in sig["reasons"][:3]:
                     log.info(f"  {r}")
-                if (sig["action"] not in ("LONG", "SHORT") or
-                    sig["conf"] < MIN_CONF):
+
+                if sig["action"] not in ("LONG", "SHORT") or sig["conf"] < MIN_CONF:
                     log.info(f"[{sym}] {sig['action']} conf:{sig['conf']}% — wait")
                     continue
 
-                # ── Pattern Memory Check ───────────────────────────
+                # ── Mini-Backtest ──────────────────────────────────────
+                bt_start = time.time()
+                bt_ok, bt_reason = check_mini_backtest(cdata_full, sig["action"],
+                                                        sig["atr"], sig=sig)
+                log.info(f"[BACKTEST] {bt_reason} ({(time.time()-bt_start)*1000:.0f}ms)")
+                if not bt_ok:
+                    log.warning(f"[{sym}] ⚠️ Mini-backtest fail — SKIP")
+                    notify(f"⚠️ {sym} {sig['action']} skipped (backtest: {bt_reason})")
+                    continue
+
+                # ── Pattern Memory ─────────────────────────────────────
                 sig_key = get_pattern_signature(sig)
                 should_trade, reason = check_pattern_history(sig_key)
                 log.info(f"[LEARN] Pattern: {sig_key}")
@@ -1350,70 +2160,169 @@ def run():
                     notify(f"⚠️ {sym} {sig['action']} skipped (poor pattern: {reason})")
                     continue
 
+                log.info("[✅ APPROVED] Both filters passed → executing trade")
+
                 size, margin = compound_size(bal, price, sig["lev"],
-                                              sig["conf"], sym)
+                                             sig["conf"], sym, side=sig["hold"])
                 if size <= 0:
                     continue
-                log.info(f"[ENTRY] {sym} margin:${margin} size:{size} "
-                         f"lev:{sig['lev']}x")
+
+                log.info(f"[ENTRY] {sym} margin:${margin} size:{size} lev:{sig['lev']}x")
                 log.info(f"[RISK] SL:${sig['sl']:,.2f} TP1:${sig['tp1']:,.2f} "
                          f"TP2:${sig['tp2']:,.2f} TP3:${sig['tp3']:,.2f}")
+
+                # Shadow mode — log but don't execute
+                if SHADOW_MODE:
+                    log_shadow_trade(sym, sig, size, margin)
+                    save_state()
+                    continue
+
                 if not set_leverage(sym, sig["lev"]):
                     log.error(f"[ENTRY] {sym} leverage failed — abort")
                     continue
+
                 res = place_market_order(sym, sig["side"], size, "open")
-                if not res or res.get("code") != "00000":
-                    err = res.get("msg") if res else "No response"
-                    log.error(f"[ENTRY] {sym} order failed: {err}")
-                    continue
-                oid = res.get("data", {}).get("orderId", "N/A")
-                log.info(f"[ENTRY] ✅ {sig['action']} OPENED ID:{oid}")
                 time.sleep(1.5)
-                if not setup_protection(sym, sig["hold"], sig["sl"],
-                                         sig["tp1"], sig["tp2"], sig["tp3"],
-                                         size):
-                    log.error(f"[ENTRY] {sym} protection failed — closing")
-                    place_market_order(sym, "sell" if sig["side"]=="buy" else "buy",
-                                        size, "close")
-                    notify(f"⚠️ {sym} closed - protection setup failed", urgent=True)
+
+                # Verify position actually opened
+                actual_pos = None
+                for verify_attempt in range(3):
+                    current_positions = fetch_positions()
+                    if current_positions is None:
+                        log.warning(f"[ENTRY] {sym} verify attempt {verify_attempt+1}: API failed")
+                        time.sleep(2)
+                        continue
+                    for p in current_positions:
+                        if p.get("symbol") == sym and float(p.get("total", 0)) > 0:
+                            actual_pos = p
+                            break
+                    if actual_pos:
+                        break
+                    log.warning(f"[ENTRY] {sym} verify attempt {verify_attempt+1}: no position yet")
+                    time.sleep(2)
+
+                if not actual_pos:
+                    err = res.get("msg") if res else "no response"
+                    log.error(f"[ENTRY] {sym} order failed after 3 verify attempts: {err}")
                     continue
+
+                actual_size  = float(actual_pos.get("total", 0))
+                actual_entry = float(actual_pos.get("openPriceAvg", price))
+                oid = res.get("data", {}).get("orderId", "N/A") if res else "verified"
+                log.info(f"[ENTRY] ✅ {sig['action']} OPENED size={actual_size} "
+                         f"@ ${actual_entry:.2f} ID:{oid}")
+
+                # Recompute SL/TP from actual fill price
+                atr_v = sig["atr"]
+                if sig["hold"] == "long":
+                    actual_sl  = actual_entry - atr_v * SL_MULT
+                    actual_tp1 = actual_entry + atr_v * TP1_MULT
+                    actual_tp2 = actual_entry + atr_v * TP2_MULT
+                    actual_tp3 = actual_entry + atr_v * TP3_MULT
+                else:
+                    actual_sl  = actual_entry + atr_v * SL_MULT
+                    actual_tp1 = actual_entry - atr_v * TP1_MULT
+                    actual_tp2 = actual_entry - atr_v * TP2_MULT
+                    actual_tp3 = actual_entry - atr_v * TP3_MULT
+                if abs(actual_entry - sig["price"]) / sig["price"] > 0.0005:
+                    log.info(f"[ENTRY] SL/TP recomputed from actual fill "
+                             f"(diff {(actual_entry-sig['price'])/sig['price']*10000:.1f} bps)")
+
+                # Place SL immediately to minimise naked-position window
+                spec    = SYMBOL_SPECS.get(sym, {"price_precision": 2})
+                px_prec = spec.get("price_precision", 2)
+                sl_first = place_plan_order(sym, "loss_plan",
+                                            round(actual_sl, px_prec),
+                                            sig["hold"], actual_size)
+                if not sl_first:
+                    log.error(f"[ENTRY] {sym} SL placement failed — emergency close")
+                    cancel_all_plan_orders(sym)
+                    close_side = "sell" if sig["side"] == "buy" else "buy"
+                    closed = False
+                    for close_attempt in range(3):
+                        close_res = place_market_order(sym, close_side, actual_size, "close")
+                        if close_res and close_res.get("code") == "00000":
+                            closed = True
+                            break
+                        time.sleep(2)
+                    if not closed:
+                        notify(f"🚨 CRITICAL: {sym} SL+close failed — NAKED POSITION", urgent=True)
+                    else:
+                        notify(f"⚠️ {sym} closed — SL placement failed", urgent=True)
+                    continue
+
+                log.info(f"[ENTRY] 🛡️ SL placed @ ${actual_sl:.2f} — position now protected")
+
+                if not setup_protection(sym, sig["hold"], actual_sl,
+                                        actual_tp1, actual_tp2, actual_tp3,
+                                        actual_size, skip_sl=True):
+                    log.error(f"[ENTRY] {sym} TP placement failed — closing position")
+                    cancel_all_plan_orders(sym)
+                    close_side = "sell" if sig["side"] == "buy" else "buy"
+                    closed = False
+                    for close_attempt in range(3):
+                        close_res = place_market_order(sym, close_side, actual_size, "close")
+                        if close_res and close_res.get("code") == "00000":
+                            closed = True
+                            break
+                        time.sleep(2)
+                    if not closed:
+                        notify(f"🚨 CRITICAL: {sym} close failed after TP fail — NAKED", urgent=True)
+                    else:
+                        notify(f"⚠️ {sym} closed — TP setup failed", urgent=True)
+                    continue
+
+                sig["sl"]    = actual_sl
+                sig["tp1"]   = actual_tp1
+                sig["tp2"]   = actual_tp2
+                sig["tp3"]   = actual_tp3
+                sig["price"] = actual_entry
+
                 S["trade_meta"][sym] = {
-                    "entry_price":  price,
-                    "entry_time":   datetime.now().isoformat(),
-                    "side":         sig["hold"],
-                    "lev":          sig["lev"],
-                    "margin":       margin,
-                    "size":         size,
-                    "trail":        sig["trail"],
-                    "current_sl":   sig["sl"],
-                    "tp1":          sig["tp1"],
-                    "tp2":          sig["tp2"],
-                    "tp3":          sig["tp3"],
-                    "be_moved":     False,
-                    "signal_score": sig["bull"] if sig["action"]=="LONG" else sig["bear"],
-                    "confidence":   sig["conf"],
-                    "last_unrealized_pnl": 0.0,
-                    "last_mark":    price,
-                    "pattern_sig":  sig_key,  # Save for learning on close
+                    "entry_price":          actual_entry,
+                    "entry_time":           datetime.now(timezone.utc).isoformat(),
+                    "side":                 sig["hold"],
+                    "lev":                  sig["lev"],
+                    "margin":               margin,
+                    "size":                 actual_size,
+                    "trail":                sig["trail"],
+                    "current_sl":           sig["sl"],
+                    "tp1":                  sig["tp1"],
+                    "tp2":                  sig["tp2"],
+                    "tp3":                  sig["tp3"],
+                    "be_moved":             False,
+                    "signal_score":         sig["bull"] if sig["action"]=="LONG" else sig["bear"],
+                    "confidence":           sig["conf"],
+                    "last_unrealized_pnl":  0.0,
+                    "last_mark":            actual_entry,
+                    "pattern_sig":          sig_key,
                 }
                 save_state()
-                notify(f"🎯 {sym} {sig['action']} @ ${price:,.2f}\n"
+                # FIX C: show actual_entry (fill price), not pre-entry market quote
+                notify(f"🎯 {sym} {sig['action']} @ ${actual_entry:,.2f}\n"
                        f"Lev:{sig['lev']}x Conf:{sig['conf']}%\n"
-                       f"SL:${sig['sl']:,.2f} TP3:${sig['tp3']:,.2f}")
+                       f"SL:${sig['sl']:,.2f} TP3:${sig['tp3']:,.2f}", urgent=True)
                 time.sleep(3)
+
             log.info(f"\n[SLEEP] {SCAN_INTERVAL}s...")
             save_state()
-            flush_notifications()  # Send any pending Telegram updates
+            flush_notifications()
             time.sleep(SCAN_INTERVAL)
+
         except KeyboardInterrupt:
             log.info("Stopped by user.")
             save_state()
-            flush_notifications()  # Final flush
+            flush_notifications()
             notify("🛑 ARES stopped", urgent=True)
             break
         except Exception as e:
             log.error(f"[ERROR] Cycle {cycle}: {e}", exc_info=True)
             notify(f"⚠️ Bot error: {e}", urgent=True)
+            try:
+                flush_notifications()
+                save_state()
+            except Exception:
+                pass
             time.sleep(30)
 
 
