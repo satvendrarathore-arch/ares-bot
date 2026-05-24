@@ -312,6 +312,10 @@ def load_state():
 
 def save_state():
     try:
+        # Ensure directory exists (Railway /app/data may not exist on fresh deploy)
+        state_dir = os.path.dirname(STATE_FILE)
+        if state_dir:
+            os.makedirs(state_dir, exist_ok=True)
         snapshot = {}
         for k, v in S.items():
             if k == "daily_start":
