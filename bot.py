@@ -1,9 +1,33 @@
 """
-ARES ULTRA v6.4 — Pro Risk Management  (bot_fixed_v64.py)
+ARES ULTRA v6.5 — Multi-Strategy (Technical + Funding Reversion)
 Bitget USDT-M Perpetuals | BTC + ETH
 
 ═══════════════════════════════════════════════════════════
-FIX SUMMARY (over original bot_fixed.py)
+v6.5 ADDITIONS — Funding Rate Mean Reversion Strategy
+═══════════════════════════════════════════════════════════
+
+Switchable via STRATEGY env var:
+  STRATEGY=technical          → original v6.4 multi-indicator (default)
+  STRATEGY=funding_reversion  → new funding rate mean reversion
+
+FUNDING REVERSION THESIS:
+  When perpetual funding hits extremes, crowded positions unwind.
+  Take the opposite side, collect funding while waiting for mean reversion.
+
+  SHORT setup: funding > +0.03% for 3+ periods, price > 4H VWAP, 4H RSI > 65
+  LONG setup:  mirror (funding < -0.03%, price < VWAP, RSI < 35)
+
+  Exits: TP1 (40%) funding normalizes | TP2 (40%) price hits VWAP
+         TP3 (20%) 1×ATR trailing | SL 2×ATR | funding flip | 72h max hold
+
+  Sizing: 3% balance, 3x leverage (needs $250+ capital for ETH min size)
+
+  NOTE: funding strategy bypasses mini-backtest & pattern memory
+        (different setup type, too few trades to learn). Correlation
+        check + circuit breakers + outage detection still active.
+
+═══════════════════════════════════════════════════════════
+v6.4 FIX SUMMARY (over original bot_fixed.py)
 ═══════════════════════════════════════════════════════════
 
 FIX-1  _sign() — replaced hmac.new() (non-standard alias) with
@@ -186,6 +210,32 @@ SLIPPAGE_BPS_HIGH = 20
 # ── Regime Classifier ─────────────────────────────────────────
 REGIME_ADX_TREND  = 25
 REGIME_VOLAT_HIGH = 4.0
+
+# ── Strategy Selection (v6.5) ─────────────────────────────────
+# "technical"        = original multi-indicator scoring (v6.4)
+# "funding_reversion" = funding rate mean reversion (v6.5)
+STRATEGY = os.environ.get("STRATEGY", "technical").lower()
+
+# ── Funding Rate Mean Reversion Config (v6.5) ─────────────────
+FR_THRESHOLD       = 0.0003   # 0.03% — funding extreme entry trigger (relaxed from 0.05%)
+FR_CONSECUTIVE     = 3        # funding must be same-sign for 3+ periods (24h+)
+FR_RSI_HIGH        = 65       # 4H RSI overextended (SHORT setup)
+FR_RSI_LOW         = 35       # 4H RSI oversold (LONG setup)
+FR_NORMALIZE       = 0.0001   # ±0.01% — funding "normalized" (TP1 trigger)
+FR_FLIP            = 0.0003   # funding flip to opposite extreme = thesis broken (SL)
+FR_SL_ATR_MULT     = 2.0      # SL distance = 2× ATR
+FR_SUPPORT_ATR     = 1.5      # no support/resistance within 1.5× ATR
+FR_POSITION_PCT    = 0.03     # 3% of balance per trade
+FR_MAX_LEVERAGE    = 3        # max 3x leverage
+FR_MAX_HOLD_HOURS  = 72       # force close after 72 hours
+FR_VOLAT_SPIKE     = 5.0      # skip if 1h volatility > 5% (event proxy)
+FR_TP1_PCT         = 0.40     # close 40% on funding normalize
+FR_TP2_PCT         = 0.40     # close 40% at VWAP touch
+FR_TP3_PCT         = 0.20     # 20% runner with trailing
+FR_TREND_ADX       = 35       # if 4H ADX > 35, market strongly trending — don't fade it
+# Streak-based sizing: more consecutive extreme periods = stronger signal = bigger size
+FR_STREAK_BONUS    = 0.15     # +15% size per extra period beyond minimum
+FR_STREAK_MAX_MULT = 1.5      # cap size multiplier at 1.5×
 
 SYMBOL_SPECS = {
     "BTCUSDT": {"min_size": 0.0001, "precision": 4, "price_precision": 1},
@@ -559,7 +609,121 @@ def pub_funding(sym):
     return 0.0, -1
 
 
-# ── Candle Integrity Check ────────────────────────────────────
+def fetch_funding_history(sym, periods=4):
+    """
+    v6.5: Fetch past funding rates for the funding reversion strategy.
+    Returns list of floats (most recent last), or [] on failure.
+    Bitget endpoint returns most-recent-first, so we reverse.
+    """
+    data = pub_get(
+        "/api/v2/mix/market/history-fund-rate",
+        {"symbol": sym, "productType": PRODUCT_TYPE,
+         "pageSize": str(max(periods, 10))},
+    )
+    if not data:
+        return []
+    rows = data.get("data", [])
+    if not rows:
+        return []
+    rates = []
+    for r in rows:
+        try:
+            rates.append(float(r.get("fundingRate", 0)))
+        except (ValueError, TypeError):
+            continue
+    # Bitget returns newest first → reverse so oldest first, newest last
+    rates.reverse()
+    return rates[-periods:] if len(rates) >= periods else rates
+
+
+def calc_vwap_4h(highs, lows, closes, volumes):
+    """
+    v6.5: 4H VWAP for funding strategy — uses FULL window passed (no session cap).
+    Renamed from calc_vwap to avoid collision with the 96-bar session VWAP
+    used by the technical strategy (which would silently cap our 4H window).
+
+    VWAP = Σ(typical_price × volume) / Σ(volume)
+    typical_price = (high + low + close) / 3
+    """
+    if not highs or not volumes:
+        return 0.0
+    n = min(len(highs), len(lows), len(closes), len(volumes))
+    if n == 0:
+        return 0.0
+    pv_sum = 0.0
+    v_sum = 0.0
+    for i in range(n):
+        typical = (highs[i] + lows[i] + closes[i]) / 3
+        pv_sum += typical * volumes[i]
+        v_sum += volumes[i]
+    if v_sum == 0:
+        return closes[-1] if closes else 0.0
+    return pv_sum / v_sum
+
+
+def fetch_4h_data(sym, limit=120):
+    """
+    v6.5: Fetch 4H candle data for funding strategy (RSI + VWAP).
+    Returns dict with closes, highs, lows, volumes — or None on failure.
+    """
+    cdata = pub_candles(sym, "240", limit)  # 240 = 4H
+    if not cdata or len(cdata) < 20:
+        return None
+    ok, reason = validate_candles(cdata, gran_label="4H", min_bars=20)
+    if not ok:
+        log.warning(f"[FR] {sym} 4H candles invalid: {reason}")
+        return None
+    opens, highs, lows, closes, vols = safe_extract_ohlcv(cdata)
+    if not closes:
+        return None
+    return {"opens": opens, "highs": highs, "lows": lows,
+            "closes": closes, "volumes": vols}
+
+
+def check_funding_consecutive(rates, want_positive):
+    """
+    v6.5: Check if funding has been consistently positive/negative.
+    want_positive=True: all rates > 0 (longs paying — SHORT setup)
+    want_positive=False: all rates < 0 (shorts paying — LONG setup)
+    """
+    if len(rates) < FR_CONSECUTIVE:
+        return False
+    recent = rates[-FR_CONSECUTIVE:]
+    if want_positive:
+        return all(r > 0 for r in recent)
+    else:
+        return all(r < 0 for r in recent)
+
+
+def count_funding_streak(rates, want_positive):
+    """
+    v6.5: Count consecutive same-sign funding periods from most recent backwards.
+    Longer streak = stronger crowding = higher conviction = bigger size.
+    rates: oldest-first list. We walk from the newest (end) backwards.
+    """
+    streak = 0
+    for r in reversed(rates):
+        if want_positive and r > 0:
+            streak += 1
+        elif (not want_positive) and r < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def funding_streak_multiplier(streak):
+    """
+    v6.5: Convert streak length into a size multiplier.
+    Minimum streak (FR_CONSECUTIVE) = 1.0× (base).
+    Each extra period adds FR_STREAK_BONUS, capped at FR_STREAK_MAX_MULT.
+    """
+    extra = max(0, streak - FR_CONSECUTIVE)
+    mult = 1.0 + (extra * FR_STREAK_BONUS)
+    return min(mult, FR_STREAK_MAX_MULT)
+
+
+
 # FIX-5: validate candle series before indicator calculation.
 
 # Expected interval in ms for common granularities (used by gap check)
@@ -2071,6 +2235,188 @@ def generate_signal(sym, tick, cdata, fund_rate):
     }
 
 
+# ── Funding Rate Mean Reversion Signal (v6.5) ─────────────────
+
+def funding_signal(sym, tick, cdata_15m):
+    """
+    v6.5: Funding Rate Mean Reversion strategy.
+
+    Thesis: When funding rates hit extremes, crowded positions unwind.
+    Take the opposite side, collect funding while waiting for reversion.
+
+    SHORT setup (fade crowded longs):
+      1. Current funding > +0.03%
+      2. Funding positive for 3+ consecutive periods (24h+)
+      3. Price > 4H VWAP
+      4. 4H RSI > 65
+      5. No major support within 1.5× ATR below
+      6. Not in volatility spike (event proxy)
+
+    LONG setup: mirror (funding < -0.03%, negative 24h+, price < VWAP, RSI < 35)
+
+    Returns signal dict or None.
+    """
+    try:
+        price = float(tick.get("lastPr", 0))
+    except (ValueError, TypeError):
+        return None
+    if price <= 0:
+        return None
+
+    # ── 1. Current funding rate ──
+    fund_rate, fund_mins = pub_funding(sym)
+    if abs(fund_rate) < FR_THRESHOLD:
+        log.info(f"[FR] {sym} funding {fund_rate*100:.4f}% < threshold "
+                 f"{FR_THRESHOLD*100:.2f}% — no setup")
+        return None
+
+    # ── 2. Funding history (consecutive check) ──
+    # Fetch extra history so we can measure the FULL streak length for sizing
+    history = fetch_funding_history(sym, periods=10)
+    if len(history) < FR_CONSECUTIVE:
+        log.warning(f"[FR] {sym} insufficient funding history "
+                    f"({len(history)}/{FR_CONSECUTIVE}) — skip")
+        return None
+
+    funding_positive = fund_rate > 0
+    if not check_funding_consecutive(history, want_positive=funding_positive):
+        log.info(f"[FR] {sym} funding not consistent for {FR_CONSECUTIVE} periods "
+                 f"(history: {[f'{r*100:.3f}%' for r in history[-FR_CONSECUTIVE:]]}) — skip")
+        return None
+
+    # Count actual streak length (consecutive same-sign periods from most recent)
+    streak = count_funding_streak(history, want_positive=funding_positive)
+
+    # ── 3. 15m ATR + volatility spike check (event proxy) ──
+    opens, highs, lows, closes, vols = safe_extract_ohlcv(cdata_15m)
+    if not closes or len(closes) < 20:
+        log.warning(f"[FR] {sym} insufficient 15m data — skip")
+        return None
+    atr_v = calc_atr(highs, lows, closes)
+    if atr_v <= 0:
+        return None
+    # Volatility spike: last 4 candles (1h) range vs price
+    recent_range = max(highs[-4:]) - min(lows[-4:])
+    volat_1h = (recent_range / price) * 100
+    if volat_1h > FR_VOLAT_SPIKE:
+        log.warning(f"[FR] {sym} volatility spike {volat_1h:.1f}% > "
+                    f"{FR_VOLAT_SPIKE}% (event?) — skip")
+        return None
+
+    # ── 4. 4H data: VWAP + RSI ──
+    data_4h = fetch_4h_data(sym)
+    if not data_4h:
+        log.warning(f"[FR] {sym} 4H data unavailable — skip")
+        return None
+    vwap_4h = calc_vwap_4h(data_4h["highs"], data_4h["lows"],
+                           data_4h["closes"], data_4h["volumes"])
+    rsi_4h = calc_rsi(data_4h["closes"])
+    if vwap_4h <= 0:
+        return None
+
+    # ── 4b. TREND FILTER (reviewer suggestion) ──
+    # Funding strategy FADES the crowd. But fading a STRONG trend = getting run over.
+    # If 4H ADX shows a powerful trend, the "crowded" side may keep winning.
+    # Block counter-trend fades when ADX is high.
+    adx_4h = calc_adx(data_4h["highs"], data_4h["lows"], data_4h["closes"])
+    if adx_4h > FR_TREND_ADX:
+        # Strong trend present — determine direction
+        recent = data_4h["closes"][-10:]
+        trending_up = recent[-1] > recent[0] * 1.005
+        trending_down = recent[-1] < recent[0] * 0.995
+        # funding_positive → we'd SHORT. Block if strong uptrend (don't fade up-trend)
+        if funding_positive and trending_up:
+            log.info(f"[FR] {sym} SHORT blocked: strong uptrend "
+                     f"(4H ADX {adx_4h:.0f} > {FR_TREND_ADX}) — don't fade trend")
+            return None
+        # funding negative → we'd LONG. Block if strong downtrend
+        if (not funding_positive) and trending_down:
+            log.info(f"[FR] {sym} LONG blocked: strong downtrend "
+                     f"(4H ADX {adx_4h:.0f} > {FR_TREND_ADX}) — don't fade trend")
+            return None
+
+    # ── 5. Determine setup direction ──
+    action = side = hold = None
+
+    if funding_positive:
+        # SHORT setup — fade crowded longs
+        # Need: price > VWAP (longs trapped high) AND RSI > 65 (overextended)
+        if price <= vwap_4h:
+            log.info(f"[FR] {sym} SHORT blocked: price ${price:.2f} "
+                     f"not above 4H VWAP ${vwap_4h:.2f}")
+            return None
+        if rsi_4h <= FR_RSI_HIGH:
+            log.info(f"[FR] {sym} SHORT blocked: 4H RSI {rsi_4h:.0f} "
+                     f"not > {FR_RSI_HIGH}")
+            return None
+        # Check no major support within 1.5× ATR below
+        support_zone = price - (FR_SUPPORT_ATR * atr_v)
+        recent_low = min(lows[-20:])
+        if recent_low > support_zone:
+            log.info(f"[FR] {sym} SHORT blocked: support at ${recent_low:.2f} "
+                     f"within 1.5×ATR")
+            return None
+        action, side, hold = "SHORT", "sell", "short"
+    else:
+        # LONG setup — fade crowded shorts
+        if price >= vwap_4h:
+            log.info(f"[FR] {sym} LONG blocked: price ${price:.2f} "
+                     f"not below 4H VWAP ${vwap_4h:.2f}")
+            return None
+        if rsi_4h >= FR_RSI_LOW:
+            log.info(f"[FR] {sym} LONG blocked: 4H RSI {rsi_4h:.0f} "
+                     f"not < {FR_RSI_LOW}")
+            return None
+        resistance_zone = price + (FR_SUPPORT_ATR * atr_v)
+        recent_high = max(highs[-20:])
+        if recent_high < resistance_zone:
+            log.info(f"[FR] {sym} LONG blocked: resistance at ${recent_high:.2f} "
+                     f"within 1.5×ATR")
+            return None
+        action, side, hold = "LONG", "buy", "long"
+
+    # ── 6. Build signal with SL/TP ──
+    sl_d = atr_v * FR_SL_ATR_MULT
+    if action == "SHORT":
+        sl  = price + sl_d
+        tp2 = vwap_4h  # TP2 = price reverts to VWAP
+        tp3 = vwap_4h - atr_v  # runner beyond VWAP
+    else:
+        sl  = price - sl_d
+        tp2 = vwap_4h
+        tp3 = vwap_4h + atr_v
+
+    log.info(f"[FR] {sym} ✅ {action} setup | funding={fund_rate*100:.4f}% "
+             f"| 4H RSI={rsi_4h:.0f} | VWAP=${vwap_4h:.2f} | price=${price:.2f}")
+
+    return {
+        "sym": sym, "asset": sym.replace("USDT", ""),
+        "action": action, "side": side, "hold": hold,
+        "conf": 80,  # fixed conf for funding strategy (no scoring)
+        "price": price,
+        "sl": sl,
+        "tp1": None,  # TP1 is funding-normalize, not price-based
+        "tp2": tp2,
+        "tp3": tp3,
+        "lev": FR_MAX_LEVERAGE,
+        "rr": "funding",
+        "atr": atr_v,
+        "trail": atr_v,
+        "vwap_4h": vwap_4h,
+        "rsi_4h": rsi_4h,
+        "entry_funding": fund_rate,
+        "funding_streak": streak,
+        "regime": "FUNDING",
+        "strategy": "funding_reversion",
+        "reasons": [
+            f"✅ Funding {fund_rate*100:.3f}% extreme",
+            f"✅ {streak} periods consistent (streak)",
+            f"✅ 4H RSI {rsi_4h:.0f}",
+            f"✅ Price vs VWAP confirmed",
+        ],
+    }
+
+
 # ── Position Management ───────────────────────────────────────
 
 def manage_position(pos):
@@ -2161,6 +2507,254 @@ def manage_position(pos):
                     S["trade_meta"][sym] = meta
                     save_state()
                     log.info(f"[TRAIL] {sym} TP1 hit! SL → BE")
+
+
+def manage_funding_position(pos):
+    """
+    v6.5: Exit management for funding reversion strategy.
+
+    Exits:
+      TP1 (40%): funding normalizes to ±0.01% — collect easy money
+      TP2 (40%): price touches 4H VWAP — mean reversion confirmed
+      TP3 (20%): runner with 1× ATR trailing stop
+      SL: 2× ATR from entry (placed on exchange at entry)
+      SL_alt: funding flips to opposite extreme — thesis broken, exit all
+      Max hold: 72 hours — force close
+    """
+    sym  = pos.get("symbol")
+    hold = pos.get("holdSide", "long")
+    try:
+        mark  = float(pos.get("markPrice", 0))
+        size  = float(pos.get("total", 0))
+        entry = float(pos.get("openPriceAvg", mark))
+        pnl   = float(pos.get("unrealizedPL", 0))
+    except (ValueError, TypeError) as e:
+        log.warning(f"[FR-MGR] {sym} invalid numeric data: {e} — skip")
+        return
+    if not (mark == mark and entry == entry and size == size):
+        log.warning(f"[FR-MGR] {sym} NaN in position data — skip")
+        return
+    if mark <= 0 or entry <= 0 or size <= 0:
+        return
+
+    meta = S["trade_meta"].get(sym, {})
+    if not meta:
+        log.debug(f"[FR-MGR] {sym} no metadata — skip")
+        return
+
+    margin = meta.get("margin", 1)
+    pnl_pct = (pnl / margin) * 100 if margin else 0
+    open_ts = meta.get("open_ts", int(time.time() * 1000))
+    hold_hours = (int(time.time() * 1000) - open_ts) / 3600000
+    entry_funding = meta.get("entry_funding", 0)
+    vwap_4h = meta.get("vwap_4h", 0)
+
+    log.info(f"[FR-MGR] {sym} {hold.upper()} Mark:${mark:,.2f} "
+             f"PnL:{pnl:+.4f}({pnl_pct:+.1f}%) held:{hold_hours:.1f}h")
+
+    # ── Check current funding for normalize / flip ──
+    cur_funding, _ = pub_funding(sym)
+
+    # ── EXIT 1: Max hold time (72h) — force close everything ──
+    if hold_hours >= FR_MAX_HOLD_HOURS:
+        log.warning(f"[FR-MGR] {sym} max hold {FR_MAX_HOLD_HOURS}h reached — force close")
+        _funding_close_all(sym, hold, size, "max_hold")
+        return
+
+    # ── EXIT 2: Funding flipped to opposite extreme — thesis broken ──
+    was_positive = entry_funding > 0
+    if was_positive and cur_funding < -FR_FLIP:
+        log.warning(f"[FR-MGR] {sym} funding flipped negative "
+                    f"({cur_funding*100:.3f}%) — thesis broken, close all")
+        _funding_close_all(sym, hold, size, "funding_flip")
+        return
+    if (not was_positive) and cur_funding > FR_FLIP:
+        log.warning(f"[FR-MGR] {sym} funding flipped positive "
+                    f"({cur_funding*100:.3f}%) — thesis broken, close all")
+        _funding_close_all(sym, hold, size, "funding_flip")
+        return
+
+    # ── EXIT 3: TP1 — funding normalized (close 40%) ──
+    if not meta.get("fr_tp1_done") and abs(cur_funding) < FR_NORMALIZE:
+        tp1_size = _round_size(sym, meta.get("orig_size", size) * FR_TP1_PCT)
+        if tp1_size > 0 and tp1_size <= size:
+            close_side = "sell" if hold == "long" else "buy"
+            res = place_market_order(sym, close_side, tp1_size, "close")
+            if res and res.get("code") == "00000":
+                meta["fr_tp1_done"] = True
+                # Move SL to breakeven on remaining 60% — lock in no-loss.
+                # After collecting funding + closing 40%, the rest should never
+                # turn into a loss if price reverses.
+                entry_price = meta.get("entry_price", entry)
+                remaining = size - tp1_size
+                if remaining > 0:
+                    # Small buffer past entry to cover fees (0.3%)
+                    be_sl = entry_price * (0.997 if hold == "short" else 1.003)
+                    if update_sl_atomic(sym, hold, be_sl, remaining):
+                        meta["current_sl"] = be_sl
+                        log.info(f"[FR-MGR] {sym} SL → breakeven ${be_sl:.2f} "
+                                 f"(remaining {remaining})")
+                S["trade_meta"][sym] = meta
+                save_state()
+                log.info(f"[FR-MGR] {sym} ✅ TP1: funding normalized "
+                         f"({cur_funding*100:.4f}%) — closed 40%")
+                notify(f"💰 {sym} FR-TP1: funding normalized, closed 40%, SL→BE",
+                       urgent=True)
+        return
+
+    # ── EXIT 4: TP2 — price touches VWAP (close 40%) ──
+    if not meta.get("fr_tp2_done") and vwap_4h > 0:
+        vwap_touched = (
+            (hold == "short" and mark <= vwap_4h) or
+            (hold == "long" and mark >= vwap_4h)
+        )
+        if vwap_touched:
+            tp2_size = _round_size(sym, meta.get("orig_size", size) * FR_TP2_PCT)
+            if tp2_size > 0 and tp2_size <= size:
+                close_side = "sell" if hold == "long" else "buy"
+                res = place_market_order(sym, close_side, tp2_size, "close")
+                if res and res.get("code") == "00000":
+                    meta["fr_tp2_done"] = True
+                    S["trade_meta"][sym] = meta
+                    save_state()
+                    log.info(f"[FR-MGR] {sym} ✅ TP2: price hit VWAP "
+                             f"${vwap_4h:.2f} — closed 40%")
+                    notify(f"💰 {sym} FR-TP2: hit VWAP, closed 40%", urgent=True)
+            return
+
+    # ── EXIT 5: TP3 runner — trail remaining 20% with 1× ATR ──
+    if meta.get("fr_tp2_done"):
+        atr_v = meta.get("atr", mark * 0.01)
+        trail = atr_v  # 1× ATR trailing
+        current_sl = meta.get("current_sl", entry)
+        if hold == "long":
+            new_sl = mark - trail
+            if new_sl > current_sl and mark > entry:
+                sl_imp = (new_sl - current_sl) / current_sl if current_sl > 0 else 1
+                if sl_imp >= MIN_SL_IMPROVE:
+                    if update_sl_atomic(sym, hold, new_sl, size):
+                        meta["current_sl"] = new_sl
+                        S["trade_meta"][sym] = meta
+                        save_state()
+                        log.info(f"[FR-MGR] {sym} TP3 trail SL → ${new_sl:.2f}")
+        else:
+            new_sl = mark + trail
+            if new_sl < current_sl and mark < entry:
+                sl_imp = (current_sl - new_sl) / current_sl if current_sl > 0 else 1
+                if sl_imp >= MIN_SL_IMPROVE:
+                    if update_sl_atomic(sym, hold, new_sl, size):
+                        meta["current_sl"] = new_sl
+                        S["trade_meta"][sym] = meta
+                        save_state()
+                        log.info(f"[FR-MGR] {sym} TP3 trail SL → ${new_sl:.2f}")
+
+
+def _round_size(sym, raw_size):
+    """Round size to symbol precision."""
+    spec = SYMBOL_SPECS.get(sym, {"precision": 4})
+    return round(raw_size, spec["precision"])
+
+
+def _funding_close_all(sym, hold, size, reason):
+    """Close entire funding position with retries."""
+    cancel_all_plan_orders(sym)
+    close_side = "sell" if hold == "long" else "buy"
+    for attempt in range(3):
+        res = place_market_order(sym, close_side, size, "close")
+        if res and res.get("code") == "00000":
+            log.info(f"[FR-MGR] {sym} closed ({reason})")
+            notify(f"🔚 {sym} funding position closed: {reason}", urgent=True)
+            return True
+        time.sleep(2)
+    log.critical(f"[FR-MGR] {sym} CLOSE FAILED ({reason})")
+    notify(f"🚨 {sym} funding close FAILED — check manually!", urgent=True)
+    return False
+
+
+def _execute_funding_trade(sym, sig, size, margin):
+    """
+    v6.5: Execute a funding reversion trade.
+    Places SL on exchange (2× ATR). TP1/TP2/TP3 are managed dynamically
+    by manage_funding_position (funding-normalize, VWAP, trailing).
+    """
+    if not set_leverage(sym, FR_MAX_LEVERAGE):
+        log.error(f"[FR-ENTRY] {sym} leverage failed — abort")
+        return
+
+    res = place_market_order(sym, sig["side"], size, "open")
+    time.sleep(1.5)
+
+    # Verify position opened (3 retries)
+    actual_pos = None
+    for attempt in range(3):
+        positions = fetch_positions()
+        if positions is None:
+            log.warning(f"[FR-ENTRY] {sym} verify {attempt+1}: API failed")
+            time.sleep(2)
+            continue
+        for p in positions:
+            if p.get("symbol") == sym and float(p.get("total", 0)) > 0:
+                actual_pos = p
+                break
+        if actual_pos:
+            break
+        time.sleep(2)
+
+    if not actual_pos:
+        err = res.get("msg", "order failed") if res else "no response"
+        log.error(f"[FR-ENTRY] {sym} order failed: {err}")
+        return
+
+    actual_size  = float(actual_pos.get("total", 0))
+    actual_entry = float(actual_pos.get("openPriceAvg", sig["price"]))
+    log.info(f"[FR-ENTRY] ✅ {sig['action']} OPENED size={actual_size} "
+             f"@ ${actual_entry:.2f}")
+
+    # Recompute SL from actual fill (2× ATR)
+    atr_v = sig["atr"]
+    if sig["hold"] == "long":
+        actual_sl = actual_entry - atr_v * FR_SL_ATR_MULT
+    else:
+        actual_sl = actual_entry + atr_v * FR_SL_ATR_MULT
+
+    # Place SL immediately
+    spec = SYMBOL_SPECS.get(sym, {"price_precision": 2})
+    px_prec = spec.get("price_precision", 2)
+    sl_ok = place_plan_order(sym, "loss_plan",
+                             round(actual_sl, px_prec),
+                             sig["hold"], actual_size)
+    if not sl_ok:
+        log.error(f"[FR-ENTRY] {sym} SL failed — emergency close")
+        _funding_close_all(sym, sig["hold"], actual_size, "SL_place_failed")
+        return
+
+    log.info(f"[FR-ENTRY] 🛡️ SL @ ${actual_sl:.2f} — protected")
+
+    # Store metadata (note: TP1/TP2/TP3 managed dynamically, not placed on exchange)
+    S["trade_meta"][sym] = {
+        "entry_price":         actual_entry,
+        "entry_time":          datetime.now(timezone.utc).isoformat(),
+        "open_ts":             int(time.time() * 1000),
+        "side":                sig["hold"],
+        "lev":                 FR_MAX_LEVERAGE,
+        "margin":              margin,
+        "size":                actual_size,
+        "orig_size":           actual_size,  # for partial TP calc
+        "current_sl":          actual_sl,
+        "atr":                 atr_v,
+        "vwap_4h":             sig["vwap_4h"],
+        "entry_funding":       sig["entry_funding"],
+        "strategy":            "funding_reversion",
+        "fr_tp1_done":         False,
+        "fr_tp2_done":         False,
+        "last_unrealized_pnl": 0.0,
+        "last_mark":           actual_entry,
+    }
+    save_state()
+    notify(f"🎯 {sym} {sig['action']} (FUNDING) @ ${actual_entry:,.2f}\n"
+           f"Funding:{sig['entry_funding']*100:.3f}% SL:${actual_sl:,.2f}\n"
+           f"VWAP target:${sig['vwap_4h']:,.2f}", urgent=True)
+    time.sleep(3)
 
 
 def detect_closed_positions(open_pos):
@@ -2292,12 +2886,20 @@ def print_report(bal):
 def run():
     global OUTAGE_DETECTED
     log.info("╔══════════════════════════════════════════════════╗")
-    log.info("║  ▲ ARES ULTRA v6.4 — Pro Risk Management         ║")
+    log.info("║  ▲ ARES ULTRA v6.5 — Multi-Strategy              ║")
     log.info("║  +Circuit Breakers +Outage Detect +Regime +Shadow║")
-    log.info(
-        f"║  Compound:{COMPOUND_PCT*100:.0f}% | MaxLev:{MAX_LEVERAGE}x | "
-        f"Trades:{MAX_TRADES}     ║"
-    )
+    strat_label = "FUNDING REVERSION" if STRATEGY == "funding_reversion" else "TECHNICAL"
+    log.info(f"║  Strategy: {strat_label:<38}║")
+    if STRATEGY == "funding_reversion":
+        log.info(
+            f"║  FR: {FR_POSITION_PCT*100:.0f}% size | {FR_MAX_LEVERAGE}x lev | "
+            f"thresh {FR_THRESHOLD*100:.2f}% | hold {FR_MAX_HOLD_HOURS}h ║"
+        )
+    else:
+        log.info(
+            f"║  Compound:{COMPOUND_PCT*100:.0f}% | MaxLev:{MAX_LEVERAGE}x | "
+            f"Trades:{MAX_TRADES}     ║"
+        )
     log.info("╚══════════════════════════════════════════════════╝")
 
     # FIX-4: re-emit state path warning at startup (already logged at import
@@ -2331,7 +2933,7 @@ def run():
     if S["peak_bal"] == 0:
         S["peak_bal"] = bal
     notify(
-        f"🚀 ARES v6.4 started | Balance: ${bal:.2f}"
+        f"🚀 ARES v6.5 [{STRATEGY}] started | Balance: ${bal:.2f}"
         f"{' [SHADOW]' if SHADOW_MODE else ''}",
         urgent=True,
     )
@@ -2434,7 +3036,13 @@ def run():
                 update_shadow_outcomes()
 
             for pos in open_pos:
-                manage_position(pos)
+                # v6.5: Route to correct manager based on strategy
+                psym = pos.get("symbol")
+                pmeta = S["trade_meta"].get(psym, {})
+                if pmeta.get("strategy") == "funding_reversion":
+                    manage_funding_position(pos)
+                else:
+                    manage_position(pos)
 
             if cycle % 20 == 0:
                 print_report(bal)
@@ -2488,6 +3096,61 @@ def run():
                     f"[{sym}] ${price:,.2f} | {chg:+.2f}% | "
                     f"Fund:{fund_rate*100:.4f}% (in {fund_str})"
                 )
+
+                # ════════════════════════════════════════════════════
+                # v6.5: STRATEGY ROUTING
+                # ════════════════════════════════════════════════════
+                if STRATEGY == "funding_reversion":
+                    sig = funding_signal(sym, tick, cdata)
+                    if not sig:
+                        continue
+
+                    em = "🟢" if sig["action"] == "LONG" else "🔴"
+                    log.info(f"[FR-SIG] {em} {sig['action']} | "
+                             f"funding={sig['entry_funding']*100:.4f}% | "
+                             f"4H RSI={sig['rsi_4h']:.0f} | VWAP=${sig['vwap_4h']:.2f}")
+                    for r in sig["reasons"]:
+                        log.info(f"  {r}")
+
+                    # Funding strategy: NO mini-backtest, NO pattern memory
+                    # (different setup type, too few trades to learn)
+                    # Correlation check still applies via compound_size
+
+                    # Funding-specific sizing: 3% balance × streak multiplier, 3x lev
+                    streak = sig.get("funding_streak", FR_CONSECUTIVE)
+                    streak_mult = funding_streak_multiplier(streak)
+                    fr_margin = bal * FR_POSITION_PCT * streak_mult
+                    # Hard cap: never exceed 6% of balance even with streak bonus
+                    fr_margin = min(fr_margin, bal * 0.06)
+                    fr_size = (fr_margin * FR_MAX_LEVERAGE) / price
+                    spec = SYMBOL_SPECS.get(sym, {"min_size": 0.0001, "precision": 4})
+                    fr_size = round(fr_size, spec["precision"])
+                    if streak_mult > 1.0:
+                        log.info(f"[FR] {sym} streak={streak} → size ×{streak_mult:.2f}")
+
+                    if fr_size < spec["min_size"]:
+                        log.warning(f"[FR] {sym} size {fr_size} < min "
+                                    f"{spec['min_size']} (need more capital) — skip")
+                        continue
+
+                    # Correlation check
+                    if is_correlated_with_open(sym, new_side=sig["hold"]):
+                        log.info(f"[FR] {sym} correlated with open position — skip")
+                        continue
+
+                    log.info(f"[FR ✅ APPROVED] {sym} {sig['action']} "
+                             f"size={fr_size} margin=${fr_margin:.2f}")
+
+                    if SHADOW_MODE:
+                        log_shadow_trade(sym, sig, fr_size, fr_margin)
+                        save_state()
+                        continue
+
+                    _execute_funding_trade(sym, sig, fr_size, fr_margin)
+                    continue
+                # ════════════════════════════════════════════════════
+                # TECHNICAL STRATEGY (v6.4 — unchanged)
+                # ════════════════════════════════════════════════════
 
                 sig = generate_signal(sym, tick, cdata, fund_rate)
                 if not sig:
