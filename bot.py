@@ -1,535 +1,275 @@
 """
-ARES ULTRA v6.5 — Multi-Strategy (Technical + Funding Reversion)
+ARES v7.2 — EMA Pullback Strategy (RECTIFIED)
+==============================================
 Bitget USDT-M Perpetuals | BTC + ETH
 
-═══════════════════════════════════════════════════════════
-v6.5 ADDITIONS — Funding Rate Mean Reversion Strategy
-═══════════════════════════════════════════════════════════
+STRATEGY: 4H EMA Pullback
 
-Switchable via STRATEGY env var:
-  STRATEGY=technical          → original v6.4 multi-indicator (default)
-  STRATEGY=funding_reversion  → new funding rate mean reversion
+THESIS:
+  In a trending market, price pulls back to the EMA21 before
+  continuing. Enter at the EMA (limit order), ride the continuation.
+  Exit at 3× ATR. Stop at 1.5× ATR below entry.
 
-FUNDING REVERSION THESIS:
-  When perpetual funding hits extremes, crowded positions unwind.
-  Take the opposite side, collect funding while waiting for mean reversion.
+  LONG:  EMA9 > EMA21 > EMA50 (uptrend) + price at EMA21 + RSI 35-65
+  SHORT: EMA9 < EMA21 < EMA50 (downtrend) + price at EMA21 + RSI 35-65
 
-  SHORT setup: funding > +0.03% for 3+ periods, price > 4H VWAP, 4H RSI > 65
-  LONG setup:  mirror (funding < -0.03%, price < VWAP, RSI < 35)
+EXPECTED PERFORMANCE (estimates from market-structure analysis —
+NOT validated by code backtest; treat as hypothesis until shadow/live data):
+  Bull markets:  est. 60-70% win rate
+  Bear markets:  est. 55-62% win rate
+  Range markets: est. ~50% win rate
+  Target R:R:    2:1 minimum (enforced by TP/SL structure)
+  VALIDATE IN SHADOW MODE BEFORE LIVE CAPITAL
 
-  Exits: TP1 (40%) funding normalizes | TP2 (40%) price hits VWAP
-         TP3 (20%) 1×ATR trailing | SL 2×ATR | funding flip | 72h max hold
+FIXES APPLIED IN THIS VERSION (all labeled [FIX-N] in code):
+  [FIX-1..11] — see v7.1 (BE trigger, shadow default, logging order,
+          risk sizing, closed candles, limit clamp, preset SL,
+          non-blocking pause, TP re-arm, daily denominator, fill filter)
+  v7.2 hardening (from external code review):
+  [FIX-12] Hedge-mode verified at startup — tradeSide semantics are
+          hedge-only; bot refuses to run in one-way mode.
+  [FIX-13] Passive buffer on limit price (≥0.02% from market) so the
+          entry always posts as maker.
+  [FIX-14] Plan orders tracked by orderId; targeted cancel helper +
+          pending-plan query (covers the exchange-created preset SL).
+  [FIX-15] BE move re-sequenced: NEW breakeven SL placed and confirmed
+          FIRST, then old SL cancelled by ID. TPs never touched —
+          re-arm logic deleted. If new SL fails, nothing was cancelled,
+          so the original SL is still live. Zero naked window by design.
+  [FIX-16] Fill detection hardened: raw status logged each check
+          (verify Bitget's real vocabulary in shadow); partial fills —
+          on cancel or expiry — are activated as tracked positions with
+          TPs instead of being silently abandoned with only an SL.
 
-  Sizing: 3% balance, 3x leverage (needs $250+ capital for ETH min size)
-
-  NOTE: funding strategy bypasses mini-backtest & pattern memory
-        (different setup type, too few trades to learn). Correlation
-        check + circuit breakers + outage detection still active.
-
-═══════════════════════════════════════════════════════════
-v6.4 FIX SUMMARY (over original bot_fixed.py)
-═══════════════════════════════════════════════════════════
-
-FIX-1  _sign() — replaced hmac.new() (non-standard alias) with
-       the canonical hmac.new() from the hmac module; added an
-       explicit check so a bad secret fails loudly instead of
-       silently producing a wrong signature.
-
-FIX-2  call() None-return safety — every caller that did
-       res.get(...) without a prior `if res` check now has an
-       explicit guard.  The entry-flow crash path (place_market_order
-       → res.get("data", {}).get("orderId")) is the most critical;
-       also patched place_plan_order, cancel_plan_order, set_leverage.
-
-FIX-3  Win/loss threshold made relative to margin — was a flat
-       $0.01 which silently treated many small real wins as breakeven
-       and never updated pattern memory.  Now uses
-       max(0.01, margin * 0.002) per closed position.
-
-FIX-4  /tmp state warning — _get_state_file() now emits a prominent
-       WARNING when falling back to /tmp so the operator knows state
-       won't survive a restart.
-
-FIX-5  Candle gap / integrity check — new validate_candles() helper
-       called before indicator calculation.  Detects: too-few bars,
-       reversed series (already auto-corrected), timestamp gaps > 3×
-       the expected interval, and duplicate timestamps.  Returns
-       (ok: bool, reason: str); signal generation skips on failure.
-
-FIX-6  safe_extract_ohlcv data-quality gate — when >30 % of volume
-       rows are bad the function now returns empty lists (instead of
-       silently continuing with median-filled garbage), causing signal
-       generation to skip that cycle rather than trade on bad data.
-
-FIX-7  Sentiment per-source retry — SENTIMENT_CACHE is now a dict
-       of per-source entries, each with its own timestamp and TTL
-       (300 s on failure, 1800 s on success).  A partial failure
-       (e.g. CryptoPanic down but F&G up) retries only the failed
-       source on the next cycle instead of waiting the full 30 min.
-
-FIX-8  MTF cycle-time guard — total elapsed time for the entire
-       mtf_analysis() call is now logged at INFO level so slow
-       cycles are visible in logs.
-
-FIX-9  compound_size drawdown — minor: the function previously used
-       S["peak_bal"] directly; now receives bal explicitly and the
-       drawdown path is guarded against peak_bal == 0 more clearly
-       (was already guarded but restructured for readability).
-
-FIX-10 process_cb_expiry timestamp units — was comparing
-       now_ms (milliseconds) against cb_paused_until which is also
-       stored in ms, so the comparison was correct; however
-       trip_circuit_breaker stored pause_until as now_ms + duration*1000
-       which is correct.  Audited and confirmed consistent; added
-       an assertion comment so future changes don't break it.
-
-FIX-11 detect_closed_positions — loop-local margin lookup added so
-       the relative PnL threshold (FIX-3) actually uses the per-trade
-       margin rather than a fallback default.
-
-FIX-12 OUTAGE_DETECTED / API_FAIL_COUNT thread-safety comment —
-       these remain module globals (single-threaded bot) but are now
-       documented as single-threaded assumptions with a TODO.
-
-INHERITED FIXES (from original bot_fixed.py, unchanged):
-  Bug A  Dead unreachable code removed from check_circuit_breakers()
-  Bug B  Per-symbol open check uses all_open (exchange + tracked)
-  Bug C  Trade notification shows actual_entry (fill price)
-═══════════════════════════════════════════════════════════
+SETUP:
+  Railway Variables:
+    BITGET_API_KEY=...
+    BITGET_SECRET_KEY=...
+    BITGET_PASSPHRASE=...
+    SHADOW_MODE=true             (default true — set false ONLY when ready)
+    MAX_TRADES=2
+    RISK_PCT=1                   (true % of balance lost if SL hits)
+    MAX_LEVERAGE=3
+    SCAN_INTERVAL_SECONDS=300
+    STATE_FILE_PATH=/app/data/ares_v72_state.json
 """
 
 import os, time, hmac, hashlib, base64, json, logging, requests
-from datetime import datetime, timezone, timedelta
-from collections import deque
+from datetime import datetime, timezone
+
+# ═══════════════════════════════════════════════════════════
+# LOGGING  [FIX-3: must come BEFORE _get_state_file()]
+# ═══════════════════════════════════════════════════════════
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("ARES")
+log = logging.getLogger("ares")
 
-# ── Config ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════
+
 API_KEY    = os.environ.get("BITGET_API_KEY", "")
 SECRET_KEY = os.environ.get("BITGET_SECRET_KEY", "")
 PASSPHRASE = os.environ.get("BITGET_PASSPHRASE", "")
-TG_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TG_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-def _env_int(name, default):
-    raw = os.environ.get(name, str(default))
-    try:
-        return int(raw)
-    except (ValueError, TypeError):
-        print(f"⚠️ Invalid {name}='{raw}', using default {default}")
-        return default
-
-def _env_float(name, default):
-    raw = os.environ.get(name, str(default))
-    try:
-        return float(raw)
-    except (ValueError, TypeError):
-        print(f"⚠️ Invalid {name}='{raw}', using default {default}")
-        return default
-
-MAX_LEVERAGE  = _env_int("MAX_LEVERAGE", 10)
-SCAN_INTERVAL = _env_int("SCAN_INTERVAL_SECONDS", 120)
-COMPOUND_PCT  = _env_float("COMPOUND_PCT", 20) / 100
-MAX_TRADES    = _env_int("MAX_TRADES", 2)
-RESET_STATS   = os.environ.get("RESET_STATS", "false").lower() == "true"
-SHADOW_MODE   = os.environ.get("SHADOW_MODE", "false").lower() == "true"
 
 BASE_URL     = "https://api.bitget.com"
 PRODUCT_TYPE = "USDT-FUTURES"
 SYMBOLS      = ["BTCUSDT", "ETHUSDT"]
 
-# FIX-4: track whether we fell back to /tmp so we can warn at startup
-_STATE_FILE_IS_EPHEMERAL = False
+# [FIX-2] Shadow is the DEFAULT. You must explicitly set
+# SHADOW_MODE=false to trade real money.
+SHADOW_MODE    = os.environ.get("SHADOW_MODE", "true").lower() == "true"
+RESET_STATS    = os.environ.get("RESET_STATS", "false").lower() == "true"
+SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL_SECONDS", "300"))
+MAX_TRADES     = int(os.environ.get("MAX_TRADES", "2"))
+MAX_LEVERAGE   = int(os.environ.get("MAX_LEVERAGE", "3"))
+RISK_PCT       = float(os.environ.get("RISK_PCT", "1")) / 100  # true risk at SL
 
-def _get_state_file():
-    """
-    Find best persistent path for state file.
-    Priority: env var → /app (Railway persistent) → /tmp (fallback)
-    """
-    global _STATE_FILE_IS_EPHEMERAL
-    custom = os.environ.get("STATE_FILE_PATH")
-    if custom:
-        _STATE_FILE_IS_EPHEMERAL = False
-        return custom
-    app_dir = "/app"
-    try:
-        os.makedirs(app_dir, exist_ok=True)
-        test = os.path.join(app_dir, ".write_test")
-        with open(test, "w") as f:
-            f.write("test")
-        os.remove(test)
-        _STATE_FILE_IS_EPHEMERAL = False
-        return os.path.join(app_dir, "ares_v64_state.json")
-    except Exception:
-        pass
-    # FIX-4: loud warning so operator knows state is ephemeral
-    log.warning(
-        "[STATE] ⚠️  /app not writable — falling back to /tmp/ares_v64_state.json. "
-        "State WILL BE LOST on restart/redeploy. Set STATE_FILE_PATH env var "
-        "to a persistent volume path to fix this."
-    )
-    _STATE_FILE_IS_EPHEMERAL = True
-    return "/tmp/ares_v64_state.json"
-
-STATE_FILE = _get_state_file()
-
-# ── Risk constants ────────────────────────────────────────────
-SL_MULT        = 1.5
-TP1_MULT       = 2.0
-TP2_MULT       = 3.5
-TP3_MULT       = 6.0
-TRAIL_MULT     = 1.0
-MIN_CONF       = 65
-MAX_DAILY_LOSS = 0.06
-MAX_DRAWDOWN   = 0.12
-MAX_VOLAT      = 8.0
-MIN_SL_IMPROVE = 0.003
-
-# ── Circuit Breakers ──────────────────────────────────────────
-CB_CONSECUTIVE_LOSSES    = 5
-CB_CONSECUTIVE_API_FAILS = 10
-CB_HOURLY_LOSS_PCT       = 0.04
-CB_PAUSE_DURATION        = 3600  # seconds
-
-# ── Exchange Outage Detection ─────────────────────────────────
-OUTAGE_FAIL_THRESHOLD = 5
-OUTAGE_RETRY_INTERVAL = 60
-
-# ── Correlation-Aware Sizing ──────────────────────────────────
-CORR_REDUCTION = 0.65
-
-# ── Slippage Model ────────────────────────────────────────────
-SLIPPAGE_BPS_LOW  = 5
-SLIPPAGE_BPS_HIGH = 20
-
-# ── Regime Classifier ─────────────────────────────────────────
-REGIME_ADX_TREND  = 25
-REGIME_VOLAT_HIGH = 4.0
-
-# ── Strategy Selection (v6.5) ─────────────────────────────────
-# "technical"        = original multi-indicator scoring (v6.4)
-# "funding_reversion" = funding rate mean reversion (v6.5)
-STRATEGY = os.environ.get("STRATEGY", "technical").lower()
-
-# ── Funding Rate Mean Reversion Config (v6.5) ─────────────────
-FR_THRESHOLD       = 0.0003   # 0.03% — funding extreme entry trigger (relaxed from 0.05%)
-FR_CONSECUTIVE     = 3        # funding must be same-sign for 3+ periods (24h+)
-FR_RSI_HIGH        = 65       # 4H RSI overextended (SHORT setup)
-FR_RSI_LOW         = 35       # 4H RSI oversold (LONG setup)
-FR_NORMALIZE       = 0.0001   # ±0.01% — funding "normalized" (TP1 trigger)
-FR_FLIP            = 0.0003   # funding flip to opposite extreme = thesis broken (SL)
-FR_SL_ATR_MULT     = 2.0      # SL distance = 2× ATR
-FR_SUPPORT_ATR     = 1.5      # no support/resistance within 1.5× ATR
-FR_POSITION_PCT    = 0.03     # 3% of balance per trade
-FR_MAX_LEVERAGE    = 3        # max 3x leverage
-FR_MAX_HOLD_HOURS  = 72       # force close after 72 hours
-FR_VOLAT_SPIKE     = 5.0      # skip if 1h volatility > 5% (event proxy)
-FR_TP1_PCT         = 0.40     # close 40% on funding normalize
-FR_TP2_PCT         = 0.40     # close 40% at VWAP touch
-FR_TP3_PCT         = 0.20     # 20% runner with trailing
-FR_TREND_ADX       = 35       # if 4H ADX > 35, market strongly trending — don't fade it
-# Streak-based sizing: more consecutive extreme periods = stronger signal = bigger size
-FR_STREAK_BONUS    = 0.15     # +15% size per extra period beyond minimum
-FR_STREAK_MAX_MULT = 1.5      # cap size multiplier at 1.5×
+# Strategy params
+EMA_FAST       = 9
+EMA_MID        = 21
+EMA_SLOW       = 50
+EMA_PULL_TOL   = 0.008   # price within 0.8% of EMA21 = "at pullback"
+RSI_MIN        = 35
+RSI_MAX        = 65
+ATR_SL_MULT    = 1.5     # SL  = 1.5× ATR
+ATR_TP_MULT    = 3.0     # TP1 = 3.0× ATR (2:1)
+ATR_TP2_MULT   = 5.0     # TP2 = 5.0× ATR (runner)
+MIN_ADX        = 20
+BE_TRIGGER     = 0.80    # [FIX-1] SL→BE at 80% of distance to TP1
+PASSIVE_BUF    = 0.0002  # [FIX-13] limit must sit ≥0.02% on passive side
+MAX_DAILY_LOSS = 0.05    # 5% daily loss limit
+MAX_DRAWDOWN   = 0.15    # 15% drawdown → reduce size
 
 SYMBOL_SPECS = {
     "BTCUSDT": {"min_size": 0.0001, "precision": 4, "price_precision": 1},
     "ETHUSDT": {"min_size": 0.01,   "precision": 3, "price_precision": 2},
-    "SOLUSDT": {"min_size": 0.1,    "precision": 1, "price_precision": 3},
-    "BNBUSDT": {"min_size": 0.01,   "precision": 2, "price_precision": 2},
 }
+
+# ═══════════════════════════════════════════════════════════
+# STATE FILE
+# ═══════════════════════════════════════════════════════════
+
+def _get_state_file():
+    custom = os.environ.get("STATE_FILE_PATH")
+    if custom:
+        return custom
+    try:
+        os.makedirs("/app/data", exist_ok=True)
+        test = "/app/data/.write_test"
+        with open(test, "w") as f: f.write("ok")
+        os.remove(test)
+        return "/app/data/ares_v72_state.json"
+    except Exception:
+        log.warning(
+            "[STATE] /app/data not writable — falling back to /tmp. "
+            "State WILL BE LOST on restart. Set STATE_FILE_PATH to fix this."
+        )
+        return "/tmp/ares_v72_state.json"
+
+STATE_FILE = _get_state_file()
 
 S = {
     "start_bal":       0.0,
+    "daily_start_bal": 0.0,    # [FIX-10]
     "peak_bal":        0.0,
-    "daily_pnl":       0.0,
     "total_pnl":       0.0,
+    "daily_pnl":       0.0,
+    "daily_start":     None,
+    "paused_today":    False,  # [FIX-8]
     "wins":            0,
     "losses":          0,
     "loss_streak":     0,
     "win_streak":      0,
-    "daily_start":     datetime.now(timezone.utc).date(),
     "trade_meta":      {},
-    "pattern_memory":  {},
-    "recent_pnl_log":  [],
-    "cb_paused_until": 0,
-    "cb_reason":       "",
-    "shadow_trades":   [],
+    "pending_orders":  {},
 }
-
-# FIX-7: per-source sentiment cache
-# Structure: { source_name: {"data": ..., "timestamp": 0, "failed": False} }
-SENTIMENT_CACHE = {
-    "fg":   {"data": None, "timestamp": 0, "failed": False},
-    "news": {"data": None, "timestamp": 0, "failed": False},
-    "dom":  {"data": None, "timestamp": 0, "failed": False},
-}
-SENTIMENT_TTL_OK   = 1800   # 30 min when last fetch succeeded
-SENTIMENT_TTL_FAIL = 300    #  5 min when last fetch failed
-
-# FIX-12: single-threaded assumption note
-# API_FAIL_COUNT and OUTAGE_DETECTED are module-level mutable globals.
-# This is safe because the bot is single-threaded.  If threading/async
-# is ever added, replace these with threading.Lock-protected counters.
-API_FAIL_COUNT  = 0
-OUTAGE_DETECTED = False
-
-
-# ── State Persistence ─────────────────────────────────────────
-
-def load_state():
-    target_file = STATE_FILE
-    if not os.path.exists(target_file):
-        legacy_file = os.environ.get(
-            "STATE_FILE_PATH", "/app/ares_v63_state.json"
-        ).replace("v64", "v63")
-        if os.path.exists(legacy_file):
-            log.info("[STATE] Migrating v6.3 → v6.4 state (pattern_memory preserved)")
-            target_file = legacy_file
-        else:
-            return
-    try:
-        with open(target_file) as f:
-            saved = json.load(f)
-        expected_types = {
-            "start_bal":       (int, float),
-            "peak_bal":        (int, float),
-            "daily_pnl":       (int, float),
-            "total_pnl":       (int, float),
-            "wins":            int,
-            "losses":          int,
-            "loss_streak":     int,
-            "win_streak":      int,
-            "trade_meta":      dict,
-            "pattern_memory":  dict,
-            "recent_pnl_log":  list,
-            "cb_paused_until": (int, float),
-            "cb_reason":       str,
-            "shadow_trades":   list,
-        }
-        for k, v in saved.items():
-            if k == "daily_start":
-                try:
-                    S[k] = datetime.fromisoformat(v).date()
-                except (ValueError, TypeError):
-                    S[k] = datetime.now(timezone.utc).date()
-            elif k in S:
-                if k in expected_types:
-                    if isinstance(v, expected_types[k]):
-                        S[k] = v
-                    else:
-                        log.warning(
-                            f"[STATE] {k} has wrong type "
-                            f"({type(v).__name__} not {expected_types[k]}), keeping default"
-                        )
-                else:
-                    S[k] = v
-
-        # Migrate v6.3 pattern keys (no regime suffix) → v6.4 format
-        pm = S.get("pattern_memory", {})
-        if pm and isinstance(pm, dict):
-            migrated        = {}
-            migration_count = 0
-            for key, val in pm.items():
-                if isinstance(key, str) and "Reg_" not in key:
-                    migrated[key + "|Reg_UNKNOWN"] = val
-                    migration_count += 1
-                else:
-                    migrated[key] = val
-            if migration_count > 0:
-                log.info(f"[STATE] Migrated {migration_count} v6.3 pattern keys → v6.4 format")
-                S["pattern_memory"] = migrated
-
-        tm = S.get("trade_meta", {})
-        if tm and isinstance(tm, dict):
-            for sym, meta in tm.items():
-                if isinstance(meta, dict):
-                    old_sig = meta.get("pattern_sig")
-                    if isinstance(old_sig, str) and "Reg_" not in old_sig:
-                        meta["pattern_sig"] = old_sig + "|Reg_UNKNOWN"
-
-        log.info(
-            f"[STATE] Restored: {S['wins']}W/{S['losses']}L | "
-            f"PnL:${S['total_pnl']:.2f}"
-        )
-    except Exception as e:
-        log.warning(f"[STATE] Load failed: {e}")
 
 def save_state():
     try:
-        # Ensure directory exists (Railway /app/data may not exist on fresh deploy)
-        state_dir = os.path.dirname(STATE_FILE)
-        if state_dir:
-            os.makedirs(state_dir, exist_ok=True)
-        snapshot = {}
-        for k, v in S.items():
-            if k == "daily_start":
-                snapshot[k] = v.isoformat() if hasattr(v, "isoformat") else str(v)
-            else:
-                snapshot[k] = v
+        d = os.path.dirname(STATE_FILE)
+        if d: os.makedirs(d, exist_ok=True)
+        snap = {k: (v.isoformat() if hasattr(v, "isoformat") else v)
+                for k, v in S.items()}
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(snapshot, f, indent=2, default=str)
+            json.dump(snap, f, indent=2, default=str)
         os.replace(tmp, STATE_FILE)
     except Exception as e:
         log.warning(f"[STATE] Save failed: {e}")
 
-def reset_stats():
-    log.info("[INIT] 🔄 Stats reset requested via RESET_STATS env var")
-    S["start_bal"]       = 0.0
-    S["peak_bal"]        = 0.0
-    S["total_pnl"]       = 0.0
-    S["daily_pnl"]       = 0.0
-    S["wins"]            = 0
-    S["losses"]          = 0
-    S["loss_streak"]     = 0
-    S["win_streak"]      = 0
-    S["daily_start"]     = datetime.now(timezone.utc).date()
-    S["recent_pnl_log"]  = []
-    S["cb_paused_until"] = 0
-    S["cb_reason"]       = ""
-    S["shadow_trades"]   = []
-    save_state()
-    log.info("[INIT] ✅ Stats reset complete (pattern_memory preserved)")
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE) as f:
+            saved = json.load(f)
+        for k, v in saved.items():
+            if k == "daily_start":
+                try: S[k] = datetime.fromisoformat(v).date()
+                except Exception: S[k] = datetime.now(timezone.utc).date()
+            elif k in S:
+                S[k] = v
+        log.info(f"[STATE] Restored: {S['wins']}W/{S['losses']}L | "
+                 f"PnL:${S['total_pnl']:.2f}")
+    except Exception as e:
+        log.warning(f"[STATE] Load failed: {e}")
 
+# ═══════════════════════════════════════════════════════════
+# TELEGRAM
+# ═══════════════════════════════════════════════════════════
 
-# ── Telegram (with batching) ──────────────────────────────────
-
-NOTIFY_BUFFER         = []
-NOTIFY_LAST_FLUSH     = time.time()
-NOTIFY_FLUSH_INTERVAL = 600
-NOTIFY_BUFFER_MAX     = 10
-
-def _send_telegram_now(msg):
+def notify(msg, urgent=False):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
-    safe_msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    safe = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": safe_msg, "parse_mode": "HTML"},
-            timeout=5,
+            json={"chat_id": TG_CHAT_ID, "text": safe, "parse_mode": "HTML"},
+            timeout=5
         )
-    except Exception as e:
-        log.debug(f"[TG] Failed: {e}")
+    except Exception:
+        pass
 
-def flush_notifications():
-    global NOTIFY_LAST_FLUSH
-    if not NOTIFY_BUFFER:
-        return
-    combined = "📊 ARES Updates:\n" + "\n".join(NOTIFY_BUFFER)
-    _send_telegram_now(combined)
-    NOTIFY_BUFFER.clear()
-    NOTIFY_LAST_FLUSH = time.time()
+# ═══════════════════════════════════════════════════════════
+# BITGET API
+# ═══════════════════════════════════════════════════════════
 
-def notify(msg, urgent=False):
-    global NOTIFY_LAST_FLUSH
-    if not TG_TOKEN or not TG_CHAT_ID:
-        return
-    if urgent:
-        _send_telegram_now(f"🚨 {msg}")
-        return
-    timestamp = datetime.now().strftime("%H:%M")
-    NOTIFY_BUFFER.append(f"{timestamp} {msg}")
-    now = time.time()
-    if (
-        len(NOTIFY_BUFFER) >= NOTIFY_BUFFER_MAX
-        or now - NOTIFY_LAST_FLUSH >= NOTIFY_FLUSH_INTERVAL
-    ):
-        flush_notifications()
-
-
-# ── API Layer with retry ──────────────────────────────────────
-
-# FIX-1: use canonical hmac.new() — the original code used hmac.new()
-# which is valid Python but is an alias that can confuse linters and
-# static analysis tools.  More importantly we now validate the secret
-# is non-empty before signing so a misconfigured deployment fails fast.
-def _sign(secret, msg):
+def _sign(secret, message):
     if not secret:
-        raise ValueError("[AUTH] SECRET_KEY is empty — cannot sign request")
+        raise ValueError("SECRET_KEY is empty — check Railway variables")
     return base64.b64encode(
-        hmac.new(secret.encode(), msg.encode(), hashlib.sha256).digest()
+        hmac.new(secret.encode(), message.encode(), hashlib.sha256).digest()
     ).decode()
 
-
-# FIX-2: call() now guarantees callers always receive a dict (possibly
-# with a synthetic error code) rather than None.  This eliminates
-# AttributeError crashes on res.get(...) throughout the codebase.
-_API_ERROR_RESPONSE = {"code": "CLIENT_ERROR", "msg": "no response from exchange"}
-
 def call(method, path, params=None, body=None, retries=3):
-    last_result = None
+    """Authenticated Bitget API call. Always returns a dict (never None)."""
+    last = None
     for attempt in range(retries):
-        t = str(int(time.time() * 1000))
-        headers = {
-            "Content-Type":      "application/json",
-            "ACCESS-KEY":        API_KEY,
-            "ACCESS-TIMESTAMP":  t,
-            "ACCESS-PASSPHRASE": PASSPHRASE,
-            "locale":            "en-US",
-        }
         try:
-            if method == "GET" and params:
-                qs = "&".join(f"{k}={v}" for k, v in params.items())
-                headers["ACCESS-SIGN"] = _sign(SECRET_KEY, t + "GET" + path + "?" + qs)
-                r = requests.get(
-                    BASE_URL + path + "?" + qs, headers=headers, timeout=12
-                )
-            elif method == "POST":
-                bs = json.dumps(body) if body else ""
-                headers["ACCESS-SIGN"] = _sign(SECRET_KEY, t + "POST" + path + bs)
-                r = requests.post(
-                    BASE_URL + path, headers=headers, data=bs, timeout=12
-                )
+            ts       = str(int(time.time() * 1000))
+            body_str = json.dumps(body) if body else ""
+
+            # Build query string manually so the signature and actual URL
+            # match exactly.
+            if params:
+                query    = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+                sign_msg = ts + method + path + "?" + query + body_str
+                full_url = f"{BASE_URL}{path}?{query}"
             else:
-                headers["ACCESS-SIGN"] = _sign(SECRET_KEY, t + "GET" + path)
-                r = requests.get(BASE_URL + path, headers=headers, timeout=12)
+                sign_msg = ts + method + path + body_str
+                full_url = f"{BASE_URL}{path}"
+
+            headers = {
+                "ACCESS-KEY":        API_KEY,
+                "ACCESS-SIGN":       _sign(SECRET_KEY, sign_msg),
+                "ACCESS-TIMESTAMP":  ts,
+                "ACCESS-PASSPHRASE": PASSPHRASE,
+                "Content-Type":      "application/json",
+                "locale":            "en-US",
+            }
+
+            if method == "GET":
+                r = requests.get(full_url, headers=headers, timeout=10)
+            else:
+                r = requests.post(full_url, data=body_str, headers=headers, timeout=10)
 
             result = r.json()
-            last_result = result
+            last   = result
+
             if result.get("code") == "00000":
-                register_api_success()
                 return result
-            err_code = result.get("code", "")
-            if r.status_code == 429 or err_code in ["429", "50054"]:
-                wait = 10 * (attempt + 1)
-                log.warning(f"[API] Rate limited (status={r.status_code}), waiting {wait}s")
-                time.sleep(wait)
+
+            code = result.get("code", "")
+            if r.status_code == 429 or code in ("429", "50054"):
+                time.sleep(10 * (attempt + 1))
                 continue
-            if err_code in ["40001", "40002", "40003", "40009", "40037"]:
-                log.error(f"[API] Auth/param error: {result.get('msg')}")
+            if code in ("40001", "40002", "40003", "40009", "40037"):
+                log.error(f"[API] Auth error ({code}): {result.get('msg')}")
                 return result
-            if attempt < retries - 1:
-                wait = 2 ** attempt
-                log.debug(f"[API] Retry {attempt+1}/{retries} in {wait}s")
-                time.sleep(wait)
-        except ValueError as e:
-            # _sign raises ValueError for empty secret — re-raise immediately
-            raise
-        except Exception as e:
-            log.error(f"[API] {method} {path}: {e}")
-            register_api_failure()
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
 
-    # FIX-2: never return None; return last known result or a safe error dict
-    if last_result is not None:
-        return last_result
-    return dict(_API_ERROR_RESPONSE)
+        except ValueError:
+            raise
+        except Exception as e:
+            log.error(f"[API] {method} {path}: {e}")
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
 
+    return last or {"code": "CLIENT_ERROR", "msg": "no response from exchange"}
 
-# ── Public Market Data ────────────────────────────────────────
-
-def pub_get(path, params, retries=3):
+def pub_get(path, params=None, retries=3):
     for attempt in range(retries):
         try:
-            r    = requests.get(f"{BASE_URL}{path}", params=params, timeout=10)
+            r = requests.get(f"{BASE_URL}{path}", params=params, timeout=10)
             data = r.json()
             if data.get("code") == "00000":
                 return data
@@ -541,1885 +281,463 @@ def pub_get(path, params, retries=3):
                 time.sleep(2 ** attempt)
     return None
 
+# ═══════════════════════════════════════════════════════════
+# MARKET DATA
+# ═══════════════════════════════════════════════════════════
+
+def pub_candles_4h(sym, limit=200):
+    data = pub_get("/api/v2/mix/market/candles",
+                   {"symbol": sym, "productType": PRODUCT_TYPE,
+                    "granularity": "4H", "limit": str(limit)})
+    if not data or not data.get("data"):
+        return []
+    candles = []
+    for row in data["data"]:
+        try:
+            candles.append({
+                "ts":    int(row[0]),
+                "open":  float(row[1]),
+                "high":  float(row[2]),
+                "low":   float(row[3]),
+                "close": float(row[4]),
+                "vol":   float(row[5]),
+            })
+        except Exception:
+            continue
+    return sorted(candles, key=lambda x: x["ts"])
+
 def pub_ticker(sym):
-    data = pub_get(
-        "/api/v2/mix/market/ticker",
-        {"symbol": sym, "productType": PRODUCT_TYPE},
-    )
-    if data:
-        d = data.get("data", [])
-        return d[0] if d else None
+    data = pub_get("/api/v2/mix/market/ticker",
+                   {"symbol": sym, "productType": PRODUCT_TYPE})
+    if data and data.get("data"):
+        d = data["data"]
+        return d[0] if isinstance(d, list) else d
     return None
 
-def pub_candles(sym, gran="15m", limit=150):
-    gran_map = {
-        "5": "5m", "15": "15m", "60": "1H", "240": "4H",
-        "1": "1m", "30": "30m", "120": "2H", "360": "6H",
-    }
-    gran = gran_map.get(str(gran), gran)
-    data = pub_get(
-        "/api/v2/mix/market/candles",
-        {
-            "symbol":      sym,
-            "productType": PRODUCT_TYPE,
-            "granularity": gran,
-            "limit":       str(limit),
-        },
-    )
-    if not data:
-        return []
-    candles = data.get("data", [])
-    if candles and len(candles) >= 2:
-        if int(candles[0][0]) > int(candles[-1][0]):
-            candles = list(reversed(candles))
-    if candles and len(candles[0]) < 6:
-        log.warning(f"[CANDLES] {sym} format invalid: {len(candles[0])} fields")
-        return []
-    return candles
-
-def pub_funding(sym):
-    """Returns (rate, minutes). -1 means time unknown."""
-    data = pub_get(
-        "/api/v2/mix/market/contracts",
-        {"productType": PRODUCT_TYPE, "symbol": sym},
-    )
-    if data:
-        d = data.get("data", [])
-        if d:
-            try:
-                rate    = float(d[0].get("fundingRate", 0))
-                next_ms = int(d[0].get("nextFundingTime", 0))
-                if next_ms > 0:
-                    now_ms = int(time.time() * 1000)
-                    mins   = max(0, int((next_ms - now_ms) / 60000))
-                    return rate, mins
-            except Exception:
-                pass
-    data = pub_get(
-        "/api/v2/mix/market/current-fund-rate",
-        {"symbol": sym, "productType": PRODUCT_TYPE},
-    )
-    if data:
-        d = data.get("data", [])
-        try:
-            rate = float(d[0].get("fundingRate", 0)) if d else 0.0
-            return rate, -1
-        except Exception:
-            pass
-    return 0.0, -1
-
-
-def fetch_funding_history(sym, periods=4):
-    """
-    v6.5: Fetch past funding rates for the funding reversion strategy.
-    Returns list of floats (most recent last), or [] on failure.
-    Bitget endpoint returns most-recent-first, so we reverse.
-    """
-    data = pub_get(
-        "/api/v2/mix/market/history-fund-rate",
-        {"symbol": sym, "productType": PRODUCT_TYPE,
-         "pageSize": str(max(periods, 10))},
-    )
-    if not data:
-        return []
-    rows = data.get("data", [])
-    if not rows:
-        return []
-    rates = []
-    for r in rows:
-        try:
-            rates.append(float(r.get("fundingRate", 0)))
-        except (ValueError, TypeError):
-            continue
-    # Bitget returns newest first → reverse so oldest first, newest last
-    rates.reverse()
-    return rates[-periods:] if len(rates) >= periods else rates
-
-
-def calc_vwap_4h(highs, lows, closes, volumes):
-    """
-    v6.5: 4H VWAP for funding strategy — uses FULL window passed (no session cap).
-    Renamed from calc_vwap to avoid collision with the 96-bar session VWAP
-    used by the technical strategy (which would silently cap our 4H window).
-
-    VWAP = Σ(typical_price × volume) / Σ(volume)
-    typical_price = (high + low + close) / 3
-    """
-    if not highs or not volumes:
-        return 0.0
-    n = min(len(highs), len(lows), len(closes), len(volumes))
-    if n == 0:
-        return 0.0
-    pv_sum = 0.0
-    v_sum = 0.0
-    for i in range(n):
-        typical = (highs[i] + lows[i] + closes[i]) / 3
-        pv_sum += typical * volumes[i]
-        v_sum += volumes[i]
-    if v_sum == 0:
-        return closes[-1] if closes else 0.0
-    return pv_sum / v_sum
-
-
-def fetch_4h_data(sym, limit=120):
-    """
-    v6.5: Fetch 4H candle data for funding strategy (RSI + VWAP).
-    Returns dict with closes, highs, lows, volumes — or None on failure.
-    """
-    cdata = pub_candles(sym, "240", limit)  # 240 = 4H
-    if not cdata or len(cdata) < 20:
-        return None
-    ok, reason = validate_candles(cdata, gran_label="4H", min_bars=20)
-    if not ok:
-        log.warning(f"[FR] {sym} 4H candles invalid: {reason}")
-        return None
-    opens, highs, lows, closes, vols = safe_extract_ohlcv(cdata)
-    if not closes:
-        return None
-    return {"opens": opens, "highs": highs, "lows": lows,
-            "closes": closes, "volumes": vols}
-
-
-def check_funding_consecutive(rates, want_positive):
-    """
-    v6.5: Check if funding has been consistently positive/negative.
-    want_positive=True: all rates > 0 (longs paying — SHORT setup)
-    want_positive=False: all rates < 0 (shorts paying — LONG setup)
-    """
-    if len(rates) < FR_CONSECUTIVE:
-        return False
-    recent = rates[-FR_CONSECUTIVE:]
-    if want_positive:
-        return all(r > 0 for r in recent)
-    else:
-        return all(r < 0 for r in recent)
-
-
-def count_funding_streak(rates, want_positive):
-    """
-    v6.5: Count consecutive same-sign funding periods from most recent backwards.
-    Longer streak = stronger crowding = higher conviction = bigger size.
-    rates: oldest-first list. We walk from the newest (end) backwards.
-    """
-    streak = 0
-    for r in reversed(rates):
-        if want_positive and r > 0:
-            streak += 1
-        elif (not want_positive) and r < 0:
-            streak += 1
-        else:
-            break
-    return streak
-
-
-def funding_streak_multiplier(streak):
-    """
-    v6.5: Convert streak length into a size multiplier.
-    Minimum streak (FR_CONSECUTIVE) = 1.0× (base).
-    Each extra period adds FR_STREAK_BONUS, capped at FR_STREAK_MAX_MULT.
-    """
-    extra = max(0, streak - FR_CONSECUTIVE)
-    mult = 1.0 + (extra * FR_STREAK_BONUS)
-    return min(mult, FR_STREAK_MAX_MULT)
-
-
-
-# FIX-5: validate candle series before indicator calculation.
-
-# Expected interval in ms for common granularities (used by gap check)
-_GRAN_MS = {
-    "1m": 60_000, "5m": 300_000, "15m": 900_000,
-    "30m": 1_800_000, "1H": 3_600_000, "2H": 7_200_000,
-    "4H": 14_400_000, "6H": 21_600_000,
-}
-
-def validate_candles(candles, gran_label="15m", min_bars=60):
-    """
-    Returns (ok: bool, reason: str).
-    Checks: minimum bar count, all-same timestamp (degenerate),
-    large gaps (> 3× expected interval), duplicate timestamps.
-    """
-    if not candles or len(candles) < min_bars:
-        return False, f"only {len(candles) if candles else 0} bars (need {min_bars})"
-
-    # Parse timestamps
-    try:
-        timestamps = [int(c[0]) for c in candles]
-    except (IndexError, TypeError, ValueError) as e:
-        return False, f"timestamp parse error: {e}"
-
-    # Check monotonically increasing
-    if timestamps != sorted(timestamps):
-        return False, "timestamps not sorted ascending"
-
-    # Check for duplicates
-    if len(set(timestamps)) != len(timestamps):
-        dupes = len(timestamps) - len(set(timestamps))
-        return False, f"{dupes} duplicate timestamps"
-
-    # Gap check — only if we know the expected interval
-    expected_ms = _GRAN_MS.get(gran_label)
-    if expected_ms and len(timestamps) >= 2:
-        gaps = [timestamps[i] - timestamps[i - 1] for i in range(1, len(timestamps))]
-        max_gap = max(gaps)
-        if max_gap > expected_ms * 3:
-            gap_min = max_gap // 60_000
-            return False, f"data gap of {gap_min}min detected (expected ~{expected_ms//60000}min bars)"
-
-    return True, "ok"
-
-
-# ── Sentiment ─────────────────────────────────────────────────
-# FIX-7: per-source TTL so a partial failure retries only the dead source.
-
-def _should_refresh(source_key):
-    entry = SENTIMENT_CACHE[source_key]
-    age   = time.time() - entry["timestamp"]
-    ttl   = SENTIMENT_TTL_FAIL if entry["failed"] else SENTIMENT_TTL_OK
-    return entry["data"] is None or age > ttl
-
-def fetch_fear_greed():
-    try:
-        r = requests.get("https://api.alternative.me/fng/", timeout=8)
-        d = r.json().get("data", [])
-        if d:
-            return int(d[0].get("value", 50)), d[0].get("value_classification", "Neutral")
-    except Exception:
-        pass
-    return None, None
-
-def fetch_news_sentiment():
-    try:
-        r = requests.get(
-            "https://cryptopanic.com/api/free/v1/posts/",
-            params={"public": "true", "currencies": "BTC,ETH"},
-            timeout=8,
-        )
-        posts = r.json().get("results", [])[:20]
-        bull  = sum(
-            1 for p in posts
-            if p.get("votes", {}).get("positive", 0) > p.get("votes", {}).get("negative", 0)
-        )
-        bear  = sum(
-            1 for p in posts
-            if p.get("votes", {}).get("negative", 0) > p.get("votes", {}).get("positive", 0)
-        )
-        total = max(len(posts), 1)
-        return (bull - bear) / total * 100, bull, bear
-    except Exception:
-        return None, 0, 0
-
-def fetch_btc_dominance():
-    try:
-        r = requests.get("https://api.coingecko.com/api/v3/global", timeout=8)
-        d = r.json().get("data", {})
-        return float(d.get("market_cap_percentage", {}).get("btc", 50))
-    except Exception:
-        return None
-
-def get_sentiment():
-    """
-    FIX-7: Each source (fg, news, dom) refreshes independently.
-    Returns a combined dict with the most recent available data per source.
-    """
-    now = time.time()
-
-    if _should_refresh("fg"):
-        fg_val, fg_cls = fetch_fear_greed()
-        ok = fg_val is not None
-        SENTIMENT_CACHE["fg"] = {
-            "data":      {"fg_value": fg_val, "fg_class": fg_cls},
-            "timestamp": now,
-            "failed":    not ok,
-        }
-        if ok:
-            log.info(f"[SENTIMENT] F&G:{fg_val}({fg_cls})")
-        else:
-            log.debug("[SENTIMENT] F&G fetch failed — retry in 5min")
-
-    if _should_refresh("news"):
-        news_sent, bull, bear = fetch_news_sentiment()
-        ok = news_sent is not None
-        SENTIMENT_CACHE["news"] = {
-            "data":      {"news_sent": news_sent, "bull_news": bull, "bear_news": bear},
-            "timestamp": now,
-            "failed":    not ok,
-        }
-        if ok:
-            log.info(f"[SENTIMENT] News:{news_sent:+.0f}%")
-        else:
-            log.debug("[SENTIMENT] News fetch failed — retry in 5min")
-
-    if _should_refresh("dom"):
-        btc_dom = fetch_btc_dominance()
-        ok = btc_dom is not None
-        SENTIMENT_CACHE["dom"] = {
-            "data":      {"btc_dom": btc_dom},
-            "timestamp": now,
-            "failed":    not ok,
-        }
-        if ok:
-            log.info(f"[SENTIMENT] BTC.D:{btc_dom:.1f}%")
-        else:
-            log.debug("[SENTIMENT] BTC dominance fetch failed — retry in 5min")
-
-    # Merge all cached source data into one flat dict
-    combined = {}
-    for src in ("fg", "news", "dom"):
-        src_data = SENTIMENT_CACHE[src].get("data") or {}
-        combined.update(src_data)
-    return combined
-
-
-# ── Authenticated Endpoints ───────────────────────────────────
-
-def fetch_recent_fills(sym, limit=30):
-    res = call(
-        "GET", "/api/v2/mix/order/fills",
-        params={"productType": PRODUCT_TYPE, "symbol": sym, "limit": str(limit)},
-    )
-    # FIX-2: call() now always returns a dict, safe to .get() directly
-    if res.get("code") == "00000":
-        data = res.get("data", {})
-        if isinstance(data, dict):
-            return data.get("fillList", [])
-        return data if isinstance(data, list) else []
-    return []
-
 def fetch_balance():
-    res = call(
-        "GET", "/api/v2/mix/account/accounts",
-        params={"productType": PRODUCT_TYPE},
-    )
-    if res.get("code") == "00000" and res.get("data"):
-        for item in res["data"]:
-            if item.get("marginCoin", "").upper() == "USDT":
-                try:
-                    return float(item.get("available", 0))
-                except Exception:
-                    pass
+    res = call("GET", "/api/v2/mix/account/account-list",
+               params={"productType": PRODUCT_TYPE})
+    if res and res.get("data"):
+        for acc in res["data"]:
+            if acc.get("marginCoin") == "USDT":
+                return float(acc.get("available", 0))
     return 0.0
 
 def fetch_positions():
-    """Returns list of open positions, or None on API failure.
-    Callers must distinguish [] (no positions) from None (API failure).
-    """
-    res = call(
-        "GET", "/api/v2/mix/position/all-position",
-        params={"productType": PRODUCT_TYPE, "marginCoin": "USDT"},
-    )
-    # FIX-2: call() always returns a dict now; None path preserved for
-    # callers that check `if open_pos is None`
-    if res.get("code") != "00000":
-        return None
+    res = call("GET", "/api/v2/mix/position/all-position",
+               params={"productType": PRODUCT_TYPE, "marginCoin": "USDT"})
+    if not res or res.get("code") != "00000":
+        return None  # API failure — don't assume no positions
     data = res.get("data") or []
     return [p for p in data if float(p.get("total", 0)) > 0]
 
-def fetch_pending_plan_orders(sym):
-    res = call(
-        "GET", "/api/v2/mix/order/orders-plan-pending",
-        params={"productType": PRODUCT_TYPE, "symbol": sym},
-    )
-    if res.get("code") == "00000" and res.get("data"):
-        return res["data"].get("entrustedList", [])
-    return []
-
-def cancel_plan_order(sym, order_id, plan_type):
-    res = call(
-        "POST", "/api/v2/mix/order/cancel-plan-order",
-        body={
-            "symbol":      sym,
-            "productType": PRODUCT_TYPE,
-            "marginCoin":  "USDT",
-            "orderIdList": [{"orderId": order_id}],
-            "planType":    plan_type,
-        },
-    )
-    # FIX-2: res is always a dict
-    return res.get("code") == "00000"
-
-def cancel_all_plan_orders(sym):
-    orders = fetch_pending_plan_orders(sym)
-    if not orders:
-        return 0
-    cancelled = 0
-    for order in orders:
-        oid   = order.get("orderId")
-        ptype = order.get("planType")
-        if cancel_plan_order(sym, oid, ptype):
-            cancelled += 1
-            time.sleep(0.2)
-    if cancelled:
-        log.info(f"[CANCEL] {sym}: {cancelled}/{len(orders)} plan orders cancelled")
-    return cancelled
-
-def cancel_sl_orders_only(sym):
-    orders    = fetch_pending_plan_orders(sym)
-    cancelled = 0
-    for order in orders:
-        if order.get("planType") == "loss_plan":
-            if cancel_plan_order(sym, order.get("orderId"), "loss_plan"):
-                cancelled += 1
-                time.sleep(0.2)
-    return cancelled
-
-def set_leverage(sym, lev):
-    success = True
-    for side in ["long", "short"]:
-        res = call(
-            "POST", "/api/v2/mix/account/set-leverage",
-            body={
-                "symbol":      sym,
-                "productType": PRODUCT_TYPE,
-                "marginCoin":  "USDT",
-                "leverage":    str(lev),
-                "holdSide":    side,
-            },
-        )
-        # FIX-2: res is always a dict
-        if res.get("code") != "00000":
-            err = res.get("msg", "no response")
-            log.warning(f"[LEV] {sym} {side} {lev}x failed: {err}")
-            success = False
-    return success
-
-def place_market_order(sym, side, size, trade_side):
-    return call(
-        "POST", "/api/v2/mix/order/place-order",
-        body={
-            "symbol":      sym,
-            "productType": PRODUCT_TYPE,
-            "marginMode":  "isolated",
-            "marginCoin":  "USDT",
-            "size":        str(size),
-            "side":        side,
-            "tradeSide":   trade_side,
-            "orderType":   "market",
-            "force":       "gtc",
-        },
-    )
-
-def place_plan_order(sym, plan_type, trigger_px, hold_side, size):
-    spec    = SYMBOL_SPECS.get(sym, {"price_precision": 2})
-    px_prec = spec.get("price_precision", 2)
-    res = call(
-        "POST", "/api/v2/mix/order/place-tpsl-order",
-        body={
-            "symbol":       sym,
-            "productType":  PRODUCT_TYPE,
-            "marginCoin":   "USDT",
-            "planType":     plan_type,
-            "triggerPrice": str(round(trigger_px, px_prec)),
-            "triggerType":  "mark_price",
-            "executePrice": "0",
-            "holdSide":     hold_side,
-            "size":         str(size),
-        },
-    )
-    # FIX-2: res is always a dict
-    return res.get("code") == "00000"
-
-
-# ── Risk Setup ────────────────────────────────────────────────
-
-def setup_protection(sym, hold_side, sl, tp1, tp2, tp3, total_size, skip_sl=False):
-    """Place SL + 3 TPs on exchange.
-    skip_sl=True: caller already placed SL (minimises naked-position window).
-    """
-    spec      = SYMBOL_SPECS.get(sym, {"precision": 4, "min_size": 0.0001})
-    full_size = round(total_size, spec["precision"])
-    if not skip_sl:
-        if not place_plan_order(sym, "loss_plan", sl, hold_side, full_size):
-            log.error(f"[PROTECTION] {sym} SL placement FAILED")
-            notify(f"❌ {sym} SL placement failed!", urgent=True)
-            return False
-        log.info(f"[PROTECTION] {sym} SL @ ${sl:,.2f}")
-        time.sleep(0.4)
-    tp1_size = round(total_size * 0.25, spec["precision"])
-    tp2_size = round(total_size * 0.50, spec["precision"])
-    tp3_size = round(total_size - tp1_size - tp2_size, spec["precision"])
-    if min(tp1_size, tp2_size, tp3_size) < spec["min_size"]:
-        log.warning(f"[PROTECTION] {sym} sizes too small to split — TP3 only")
-        place_plan_order(sym, "profit_plan", tp3, hold_side, full_size)
-        return True
-    for tp_px, sz, label in [
-        (tp1, tp1_size, "TP1"),
-        (tp2, tp2_size, "TP2"),
-        (tp3, tp3_size, "TP3"),
-    ]:
-        if place_plan_order(sym, "profit_plan", tp_px, hold_side, sz):
-            log.info(f"[PROTECTION] {sym} {label} @ ${tp_px:,.2f} (size {sz})")
-        else:
-            log.warning(f"[PROTECTION] {sym} {label} placement failed")
-        time.sleep(0.4)
-    return True
-
-def update_sl_atomic(sym, hold_side, new_sl, current_size):
-    spec = SYMBOL_SPECS.get(sym, {"precision": 4})
-    size = round(current_size, spec["precision"])
-    cancel_sl_orders_only(sym)
-    time.sleep(0.4)
-    if place_plan_order(sym, "loss_plan", new_sl, hold_side, size):
-        log.info(f"[SL UPDATE] {sym} → ${new_sl:,.2f}")
-        return True
-    else:
-        log.error(f"[SL UPDATE] {sym} FAILED — position unprotected!")
-        notify(f"⚠️ {sym} SL update failed — check manually!", urgent=True)
+def check_exchange_health():
+    try:
+        r = requests.get(f"{BASE_URL}/api/v2/public/time", timeout=5)
+        return r.json().get("code") == "00000"
+    except Exception:
         return False
 
+def check_position_mode():
+    """
+    [FIX-12] This bot's order semantics (tradeSide=open/close,
+    holdSide on plan orders) assume HEDGE mode. Bitget ignores
+    tradeSide in one-way mode, which silently changes behavior.
+    Verify at startup and refuse to run in the wrong mode.
+    """
+    res = call("GET", "/api/v2/mix/account/account-list",
+               params={"productType": PRODUCT_TYPE})
+    if res and res.get("data"):
+        for acc in res["data"]:
+            if acc.get("marginCoin") == "USDT":
+                mode = str(acc.get("posMode", ""))
+                log.info(f"[INIT] Position mode: {mode or 'unknown'}")
+                return mode
+    return ""
 
-# ── Indicators ────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# INDICATORS
+# ═══════════════════════════════════════════════════════════
 
 def ema(data, p):
-    if len(data) < p:
-        return data[-1] if data else 0
+    if not data: return 0
+    if len(data) < p: return data[-1]
     k = 2 / (p + 1)
     v = sum(data[:p]) / p
     for x in data[p:]:
         v = x * k + v * (1 - k)
     return v
 
-def ema_series(data, p):
-    if len(data) < p:
-        return [data[-1]] * len(data) if data else [0]
-    k   = 2 / (p + 1)
-    out = [sum(data[:p]) / p]
-    for x in data[p:]:
-        out.append(x * k + out[-1] * (1 - k))
-    return out
-
 def calc_rsi(closes, p=14):
-    if len(closes) < p + 1:
-        return 50
-    diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    if len(closes) < p + 1: return 50
+    diffs = [closes[i] - closes[i-1] for i in range(1, len(closes))]
     g = sum(max(d, 0) for d in diffs[-p:]) / p
     l = sum(abs(min(d, 0)) for d in diffs[-p:]) / p
-    if g == 0 and l == 0:
-        return 50
-    if l == 0:
-        return 100 if g > 0 else 50
+    if g == 0 and l == 0: return 50
+    if l == 0: return 100
     return 100 - (100 / (1 + g / l))
-
-def calc_macd(closes):
-    if len(closes) < 35:
-        return 0, 0, 0
-    e12 = ema_series(closes, 12)
-    e26 = ema_series(closes, 26)
-    ml  = [e12[i] - e26[i] for i in range(min(len(e12), len(e26)))]
-    if len(ml) < 9:
-        return ml[-1], ml[-1], 0
-    sl = ema_series(ml, 9)[-1]
-    return ml[-1], sl, ml[-1] - sl
-
-def calc_bb(closes, p=20):
-    if len(closes) < p:
-        c = closes[-1]
-        return c * 1.02, c, c * 0.98
-    r   = closes[-p:]
-    mid = sum(r) / p
-    std = (sum((x - mid) ** 2 for x in r) / p) ** 0.5
-    return mid + 2 * std, mid, mid - 2 * std
 
 def calc_atr(highs, lows, closes, p=14):
     if len(closes) < p + 1:
         return closes[-1] * 0.01 if closes else 0
-    trs = [
-        max(highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]))
-        for i in range(1, len(closes))
-    ]
+    trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]),
+               abs(lows[i]-closes[i-1])) for i in range(1, len(closes))]
     if len(trs) < p:
-        return sum(trs) / len(trs) if trs else closes[-1] * 0.01
+        return sum(trs) / len(trs) if trs else 0
     atr = sum(trs[:p]) / p
     for tr in trs[p:]:
-        atr = (atr * (p - 1) + tr) / p
+        atr = (atr * (p-1) + tr) / p
     return atr
 
-def calc_stoch(highs, lows, closes, k=14):
-    h, l = max(highs[-k:]), min(lows[-k:])
-    return ((closes[-1] - l) / (h - l)) * 100 if h != l else 50
-
-def calc_vwap(highs, lows, closes, vols, session_bars=96):
-    n = min(session_bars, len(closes))
-    if n == 0:
-        return closes[-1] if closes else 0
-    h  = highs[-n:]; l = lows[-n:]; c = closes[-n:]; v = vols[-n:]
-    tp = [(h[i] + l[i] + c[i]) / 3 for i in range(n)]
-    tv = sum(t * vol for t, vol in zip(tp, v))
-    sv = sum(v)
-    return tv / sv if sv else closes[-1]
-
-def safe_extract_ohlcv(cdata):
-    """
-    FIX-6: returns empty lists when > 30% of volume rows are bad,
-    rather than silently continuing with median-padded garbage.
-    """
-    if not cdata or len(cdata[0]) < 6:
-        return [], [], [], [], []
-    try:
-        highs  = [float(x[2]) for x in cdata]
-        lows   = [float(x[3]) for x in cdata]
-        closes = [float(x[4]) for x in cdata]
-        opens  = [float(x[1]) for x in cdata]
-
-        raw_vols    = []
-        bad_indices = []
-        for i, row in enumerate(cdata):
-            try:
-                v = float(row[5])
-                if v > 0:
-                    raw_vols.append(v)
-                else:
-                    raw_vols.append(None)
-                    bad_indices.append(i)
-            except Exception:
-                raw_vols.append(None)
-                bad_indices.append(i)
-
-        bad_pct = len(bad_indices) / len(cdata) if cdata else 0
-
-        # FIX-6: hard stop when > 30% of volume data is bad
-        if bad_pct > 0.30:
-            log.warning(
-                f"[DATA] {len(bad_indices)}/{len(cdata)} candles "
-                f"({bad_pct*100:.0f}%) had bad volume — refusing to use this data"
-            )
-            return [], [], [], [], []
-
-        good_vols = [v for v in raw_vols if v is not None]
-        if good_vols:
-            sorted_vols = sorted(good_vols)
-            median_vol  = sorted_vols[len(sorted_vols) // 2]
-        else:
-            median_vol = 1.0
-        vols = [median_vol if v is None else v for v in raw_vols]
-        return opens, highs, lows, closes, vols
-    except Exception as e:
-        log.error(f"[DATA] OHLCV parse failed: {e}")
-        return [], [], [], [], []
-
-
-# ── MTF Analysis ──────────────────────────────────────────────
-# FIX-8: log total MTF elapsed time.
-
-def mtf_analysis(symbol, primary_15m=None):
-    bull, bear = 0, 0
-    results    = {}
-    start      = time.time()
-    MAX_TIME   = 15
-    for gran, label, w in [("5", "5m", 1), ("15", "15m", 2), ("60", "1H", 3), ("240", "4H", 4)]:
-        if time.time() - start > MAX_TIME:
-            log.warning(f"[MTF] Timeout — skipping {label}")
-            results[label] = "⚪"
-            continue
-        try:
-            if gran == "15" and primary_15m:
-                c = primary_15m[-80:]
-            else:
-                c = pub_candles(symbol, gran, 80)
-            if len(c) < 30:
-                results[label] = "⚪"
-                continue
-            _, hhs, lls, cls, _ = safe_extract_ohlcv(c)
-            if not cls:
-                results[label] = "⚪"
-                continue
-            e9, e21   = ema(cls, 9), ema(cls, 21)
-            r         = calc_rsi(cls)
-            _, _, mh  = calc_macd(cls)
-            bbu, _, bbl = calc_bb(cls)
-            sk        = calc_stoch(hhs, lls, cls)
-            tb, tr    = 0, 0
-            if e9 > e21:  tb += 2
-            else:          tr += 2
-            if r < 35:     tb += 2
-            elif r > 65:   tr += 2
-            elif r > 50:   tb += 1
-            else:          tr += 1
-            if mh > 0:     tb += 1
-            else:          tr += 1
-            if cls[-1] <= bbl:  tb += 1
-            elif cls[-1] >= bbu: tr += 1
-            if sk < 25:    tb += 1
-            elif sk > 75:  tr += 1
-            bull += tb * w
-            bear += tr * w
-            results[label] = "🟢" if tb > tr else "🔴" if tr > tb else "⚪"
-        except Exception as e:
-            log.debug(f"[MTF] {label}: {e}")
-            results[label] = "⚪"
-
-    # FIX-8: log total MTF duration
-    elapsed_ms = int((time.time() - start) * 1000)
-    log.info(f"[MTF] {symbol} completed in {elapsed_ms}ms")
-    return bull, bear, results
-
-
-# ── Mini-Backtest (Pre-Trade Validation) ──────────────────────
-
-MINI_BT_LOOKBACK    = 300
-MINI_BT_FORWARD     = 20
-MINI_BT_MIN_SAMPLES = 3
-MINI_BT_MIN_WR      = 0.40
-
-def mini_backtest_signal(candles, action, atr, sig=None, sl_mult=SL_MULT, tp_mult=TP2_MULT):
-    """Scan past candles for similar setups and check historical win rate.
-    Returns: (win_rate, num_samples, reason_str)
-    """
-    if action not in ("LONG", "SHORT"):
-        return None, 0, f"invalid action ({action})"
-    if len(candles) < 100:
-        return None, 0, "insufficient candles"
-    if atr is None or atr <= 0:
-        return None, 0, f"invalid ATR ({atr})"
-
-    _, highs, lows, closes, _ = safe_extract_ohlcv(candles)
-    if len(closes) < 100:
-        return None, 0, "OHLCV parse failed"
-
-    if sig is not None:
-        sig_rsi   = sig.get("rsi", 50)
-        sig_mh    = sig.get("macd_h", 0)
-        sig_stoch = sig.get("stoch", 50)
-        rsi_lo,   rsi_hi   = sig_rsi - 10,   sig_rsi + 10
-        stoch_lo, stoch_hi = sig_stoch - 10, sig_stoch + 10
-        macd_positive      = sig_mh > 0
-    else:
-        if action == "LONG":
-            rsi_lo, rsi_hi     = 0, 45
-            stoch_lo, stoch_hi = 0, 40
-            macd_positive      = True
-        else:
-            rsi_lo, rsi_hi     = 55, 100
-            stoch_lo, stoch_hi = 60, 100
-            macd_positive      = False
-
-    scan_end        = len(closes) - MINI_BT_FORWARD
-    scan_start      = max(50, scan_end - MINI_BT_LOOKBACK)
-    actual_lookback = scan_end - scan_start
-    wins = losses = ambiguous = 0
-
-    for i in range(scan_start, scan_end):
-        window_closes = closes[:i + 1]
-        window_highs  = highs[:i + 1]
-        window_lows   = lows[:i + 1]
-        if len(window_closes) < 50:
-            continue
-        try:
-            r        = calc_rsi(window_closes)
-            _, _, mh = calc_macd(window_closes)
-            sk       = calc_stoch(window_highs, window_lows, window_closes)
-            e9       = ema(window_closes, 9)
-            e21      = ema(window_closes, 21)
-        except Exception:
-            continue
-
-        macd_match = (mh > 0) == macd_positive
-        ema_match  = (e9 > e21) if action == "LONG" else (e9 < e21)
-        if not (
-            rsi_lo <= r <= rsi_hi
-            and stoch_lo <= sk <= stoch_hi
-            and macd_match
-            and ema_match
-        ):
-            continue
-
-        entry        = closes[i]
-        future_highs = highs[i + 1: i + 1 + MINI_BT_FORWARD]
-        future_lows  = lows[i + 1: i + 1 + MINI_BT_FORWARD]
-        if not future_highs or not future_lows:
-            continue
-
-        if action == "LONG":
-            target = entry + atr * tp_mult
-            stop   = entry - atr * sl_mult
-        else:
-            target = entry - atr * tp_mult
-            stop   = entry + atr * sl_mult
-
-        hit_target = hit_stop = False
-        for j in range(len(future_highs)):
-            if action == "LONG":
-                sl_hit = future_lows[j] <= stop
-                tp_hit = future_highs[j] >= target
-            else:
-                sl_hit = future_highs[j] >= stop
-                tp_hit = future_lows[j] <= target
-
-            if sl_hit and tp_hit:
-                hit_stop = True
-                ambiguous += 1
-                break
-            elif sl_hit:
-                hit_stop = True
-                break
-            elif tp_hit:
-                hit_target = True
-                break
-
-        if hit_target:
-            wins += 1
-        elif hit_stop:
-            losses += 1
-
-    total = wins + losses
-    if total == 0:
-        return None, 0, "no similar setups found"
-
-    wr      = wins / total
-    amb_str = f", {ambiguous} ambig" if ambiguous > 0 else ""
-    reason  = f"{wins}W/{losses}L ({wr*100:.0f}%) in {actual_lookback}c{amb_str}"
-    return wr, total, reason
-
-
-def check_mini_backtest(candles, action, atr, sig=None):
-    wr, samples, reason = mini_backtest_signal(candles, action, atr, sig=sig)
-    if wr is None:
-        return True, reason
-    if samples < MINI_BT_MIN_SAMPLES:
-        return True, f"only {samples} samples — allowed"
-    if wr < MINI_BT_MIN_WR:
-        return False, f"{reason} < {MINI_BT_MIN_WR*100:.0f}% threshold"
-    return True, reason
-
-
-# ── Pattern Memory (Self-Learning) ────────────────────────────
-
-PATTERN_MIN_SAMPLES  = 5
-PATTERN_MIN_WIN_RATE = 0.35
-PATTERN_MAX_ENTRIES  = 200
-PATTERN_PRUNE_AFTER  = 250
-
-def _safe_num(v, default):
-    if v is None:
-        return default
-    try:
-        f = float(v)
-        if f != f:  # NaN check
-            return default
-        return f
-    except (ValueError, TypeError):
-        return default
-
-def get_pattern_signature(sig):
-    if not isinstance(sig, dict):
-        return "UNKNOWN|all_default"
-
-    sym = sig.get("sym") or sig.get("asset", "ANY")
-    if not isinstance(sym, str):
-        sym = "ANY"
-
-    action = sig.get("action")
-    if not isinstance(action, str):
-        action = "UNKNOWN"
-    parts = [sym, action]
-
-    rsi = _safe_num(sig.get("rsi"), 50)
-    if rsi < 30:   parts.append("RSI_xover")
-    elif rsi < 40: parts.append("RSI_low")
-    elif rsi > 70: parts.append("RSI_xhigh")
-    elif rsi > 60: parts.append("RSI_high")
-    else:          parts.append("RSI_mid")
-
-    mh = _safe_num(sig.get("macd_h"), 0)
-    parts.append("MACD_pos" if mh > 0 else "MACD_neg")
-
-    stoch = _safe_num(sig.get("stoch"), 50)
-    if stoch < 25:   parts.append("Stoch_low")
-    elif stoch > 75: parts.append("Stoch_high")
-    else:            parts.append("Stoch_mid")
-
-    vol_r = _safe_num(sig.get("vol_r"), 1)
-    if vol_r > 2:     parts.append("Vol_surge")
-    elif vol_r > 1.3: parts.append("Vol_above")
-    else:             parts.append("Vol_norm")
-
-    volat = _safe_num(sig.get("volat"), 1)
-    if volat < 1.5: parts.append("Volat_low")
-    elif volat < 3: parts.append("Volat_mid")
-    else:           parts.append("Volat_high")
-
-    conf = _safe_num(sig.get("conf"), 65)
-    if conf >= 85:   parts.append("Conf_xhigh")
-    elif conf >= 75: parts.append("Conf_high")
-    else:            parts.append("Conf_mid")
-
-    regime = sig.get("regime", "UNKNOWN")
-    if not isinstance(regime, str):
-        regime = "UNKNOWN"
-    parts.append(f"Reg_{regime}")
-
-    return "|".join(parts)
-
-def check_pattern_history(sig_key):
-    if not sig_key:
-        return True, "no pattern key"
-
-    pm = S.get("pattern_memory", {})
-    if not isinstance(pm, dict):
-        log.warning("[LEARN] pattern_memory corrupted (not dict), resetting")
-        S["pattern_memory"] = {}
-        return True, "memory reset"
-
-    record = pm.get(sig_key, {"wins": 0, "losses": 0})
-    try:
-        wins   = max(0, int(record.get("wins", 0)) if isinstance(record, dict) else 0)
-        losses = max(0, int(record.get("losses", 0)) if isinstance(record, dict) else 0)
-    except (ValueError, TypeError):
-        wins = losses = 0
-
-    total = wins + losses
-    if total < PATTERN_MIN_SAMPLES:
-        return True, f"learning ({total}/{PATTERN_MIN_SAMPLES})"
-
-    win_rate = wins / total
-    if win_rate < PATTERN_MIN_WIN_RATE:
-        return False, (
-            f"WR {win_rate*100:.0f}% < {PATTERN_MIN_WIN_RATE*100:.0f}% "
-            f"({wins}W/{losses}L)"
-        )
-    return True, f"WR {win_rate*100:.0f}% ({wins}W/{losses}L)"
-
-def update_pattern_memory(sig_key, won):
-    if not sig_key or not isinstance(sig_key, str):
-        return
-    if sig_key.startswith("UNKNOWN|"):
-        log.debug("[LEARN] Skipping UNKNOWN pattern key — not recording")
-        return
-    if won is None:
-        return
-
-    if "pattern_memory" not in S or not isinstance(S.get("pattern_memory"), dict):
-        S["pattern_memory"] = {}
-
-    if sig_key not in S["pattern_memory"]:
-        S["pattern_memory"][sig_key] = {"wins": 0, "losses": 0}
-
-    rec = S["pattern_memory"][sig_key]
-    if not isinstance(rec, dict):
-        rec = {"wins": 0, "losses": 0}
-    rec.setdefault("wins", 0)
-    rec.setdefault("losses", 0)
-
-    if won:
-        rec["wins"] += 1
-    else:
-        rec["losses"] += 1
-    S["pattern_memory"][sig_key] = rec
-
-    if len(S["pattern_memory"]) > PATTERN_PRUNE_AFTER:
-        prune_pattern_memory(protect=sig_key)
-
-def prune_pattern_memory(protect=None):
-    pm = S.get("pattern_memory", {})
-    if not isinstance(pm, dict):
-        S["pattern_memory"] = {}
-        return
-    if len(pm) <= PATTERN_MAX_ENTRIES:
-        return
-
-    def sample_count(item):
-        _, rec = item
-        if not isinstance(rec, dict):
-            return -1
-        try:
-            return int(rec.get("wins", 0)) + int(rec.get("losses", 0))
-        except (ValueError, TypeError):
-            return -1
-
-    sorted_pats = sorted(pm.items(), key=sample_count, reverse=True)
-    keep        = dict(sorted_pats[:PATTERN_MAX_ENTRIES])
-
-    if protect and protect in pm and protect not in keep:
-        if keep:
-            min_key = min(keep.keys(), key=lambda k: sample_count((k, keep[k])))
-            del keep[min_key]
-        keep[protect] = pm[protect]
-
-    pruned_count = len(pm) - len(keep)
-    S["pattern_memory"] = keep
-    if pruned_count > 0:
-        log.info(
-            f"[LEARN] Pruned {pruned_count} stale patterns "
-            f"(kept top {len(keep)} by sample count)"
-        )
-
-def print_pattern_summary():
-    pm = S.get("pattern_memory", {})
-    if not pm:
-        return
-    log.info("─── PATTERN MEMORY ───")
-
-    def safe_total(item):
-        _, rec = item
-        if not isinstance(rec, dict):
-            return 0
-        try:
-            return int(rec.get("wins", 0)) + int(rec.get("losses", 0))
-        except (ValueError, TypeError):
-            return 0
-
-    sorted_pats = sorted(pm.items(), key=safe_total, reverse=True)
-    for key, rec in sorted_pats[:10]:
-        if not isinstance(rec, dict):
-            continue
-        try:
-            wins   = int(rec.get("wins", 0))
-            losses = int(rec.get("losses", 0))
-        except (ValueError, TypeError):
-            continue
-        total = wins + losses
-        if total == 0:
-            continue
-        wr     = wins / total * 100
-        status = "✅" if wr >= 50 else "⚠️" if wr >= 35 else "❌"
-        log.info(f"  {status} {key} → {wr:.0f}% ({wins}W/{losses}L)")
-
-
-# ── Circuit Breakers ──────────────────────────────────────────
-
-def record_trade_outcome(pnl):
-    now_ms = int(time.time() * 1000)
-    if "recent_pnl_log" not in S or not isinstance(S["recent_pnl_log"], list):
-        S["recent_pnl_log"] = []
-    S["recent_pnl_log"].append([now_ms, pnl])
-    if len(S["recent_pnl_log"]) > 100:
-        S["recent_pnl_log"] = S["recent_pnl_log"][-100:]
-
-def process_cb_expiry():
-    # NOTE: cb_paused_until is stored in milliseconds (epoch_ms + duration_ms).
-    # time.time()*1000 == now_ms.  Keep these units consistent if ever editing.
-    now_ms      = int(time.time() * 1000)
-    pause_until = S.get("cb_paused_until", 0)
-    if pause_until and now_ms >= pause_until:
-        log.info("[CB] Pause expired — resetting loss_streak and pnl_log")
-        S["cb_paused_until"] = 0
-        S["cb_reason"]       = ""
-        S["loss_streak"]     = 0
-        one_hour_ago = now_ms - 3_600_000
-        S["recent_pnl_log"] = [
-            [ts, pnl] for ts, pnl in S.get("recent_pnl_log", [])
-            if ts >= one_hour_ago
-        ]
-        save_state()
-        notify("✅ Circuit breaker pause expired — trading resumed", urgent=True)
-        return True
-    return False
-
-def check_circuit_breakers(balance):
-    """Pure query — no side effects. Call process_cb_expiry() separately each cycle."""
-    now_ms      = int(time.time() * 1000)
-    pause_until = S.get("cb_paused_until", 0)
-    if pause_until and now_ms < pause_until:
-        remaining = (pause_until - now_ms) // 1000
-        return True, f"paused {remaining}s more ({S.get('cb_reason', 'unknown')})"
-
-    # Bug A (inherited): dead unreachable second return was removed here
-
-    if S.get("loss_streak", 0) >= CB_CONSECUTIVE_LOSSES:
-        return True, f"{CB_CONSECUTIVE_LOSSES} consecutive losses"
-
-    if balance > 0 and isinstance(S.get("recent_pnl_log"), list):
-        one_hour_ago = now_ms - 3_600_000
-        recent       = [pnl for ts, pnl in S["recent_pnl_log"] if ts >= one_hour_ago]
-        hourly_pnl   = sum(recent)
-        if hourly_pnl < 0 and abs(hourly_pnl) / balance > CB_HOURLY_LOSS_PCT:
-            return (
-                True,
-                f"hourly loss {abs(hourly_pnl)/balance*100:.1f}% > {CB_HOURLY_LOSS_PCT*100:.0f}%",
-            )
-
-    if API_FAIL_COUNT >= CB_CONSECUTIVE_API_FAILS:
-        return True, f"{API_FAIL_COUNT} consecutive API failures"
-
-    return False, "ok"
-
-def trip_circuit_breaker(reason):
-    # NOTE: pause duration stored in ms (CB_PAUSE_DURATION * 1000) — keep consistent
-    # with process_cb_expiry() which also works in ms.
-    now_ms = int(time.time() * 1000)
-    S["cb_paused_until"] = now_ms + (CB_PAUSE_DURATION * 1000)
-    S["cb_reason"]       = reason
-    log.error(f"⛔ CIRCUIT BREAKER TRIPPED: {reason}")
-    log.error(f"   Bot paused for {CB_PAUSE_DURATION}s ({CB_PAUSE_DURATION//60}min)")
-    notify(f"⛔ Circuit Breaker: {reason}\nPaused {CB_PAUSE_DURATION//60}min", urgent=True)
-    save_state()
-
-
-# ── Exchange Outage Protection ────────────────────────────────
-
-def check_exchange_health():
-    try:
-        r = requests.get(f"{BASE_URL}/api/v2/public/time", timeout=5)
-        if r.status_code == 200:
-            return r.json().get("code") == "00000"
-    except Exception:
-        pass
-    return False
-
-def wait_for_exchange_recovery(max_wait_seconds=86400):
-    global OUTAGE_DETECTED
-    if not OUTAGE_DETECTED:
-        return
-    log.warning("[OUTAGE] Bitget unreachable — waiting for recovery...")
-    notify("⚠️ Bitget API down — bot paused", urgent=True)
-    attempts     = 0
-    max_attempts = max_wait_seconds // OUTAGE_RETRY_INTERVAL
-    while OUTAGE_DETECTED and attempts < max_attempts:
-        time.sleep(OUTAGE_RETRY_INTERVAL)
-        attempts += 1
-        if check_exchange_health():
-            OUTAGE_DETECTED = False
-            log.info(f"[OUTAGE] ✅ Bitget recovered after {attempts*OUTAGE_RETRY_INTERVAL}s")
-            notify(f"✅ Bitget recovered after {attempts}min", urgent=True)
-            return
-        if attempts % 10 == 0:
-            log.warning(
-                f"[OUTAGE] Still down (attempt {attempts}, "
-                f"{attempts*OUTAGE_RETRY_INTERVAL/60:.0f}min elapsed)"
-            )
-    if OUTAGE_DETECTED:
-        log.error(
-            f"[OUTAGE] Max wait ({max_wait_seconds/3600:.0f}h) reached — "
-            "exchange still down."
-        )
-        notify(
-            f"🚨 Bitget down >{max_wait_seconds//3600}h — check exchange manually!",
-            urgent=True,
-        )
-
-def register_api_failure():
-    global API_FAIL_COUNT
-    API_FAIL_COUNT += 1
-
-def register_api_success():
-    global API_FAIL_COUNT
-    API_FAIL_COUNT = 0
-
-
-# ── Correlation-Aware Sizing ──────────────────────────────────
-
-CORRELATED_GROUPS = [
-    {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"},
-]
-
-def is_correlated_with_open(sym, new_side=None):
-    open_meta = S.get("trade_meta", {})
-    if not open_meta:
-        return False
-    for group in CORRELATED_GROUPS:
-        if sym in group:
-            others = group - {sym}
-            for open_sym in open_meta:
-                if open_sym not in others:
-                    continue
-                if new_side is None:
-                    return True
-                if open_meta[open_sym].get("side", "") == new_side:
-                    return True
-    return False
-
-
-# ── Slippage Model ────────────────────────────────────────────
-
-def estimate_slippage(volat_pct):
-    if volat_pct < 2:
-        bps = SLIPPAGE_BPS_LOW
-    elif volat_pct < 4:
-        bps = (SLIPPAGE_BPS_LOW + SLIPPAGE_BPS_HIGH) / 2
-    else:
-        bps = SLIPPAGE_BPS_HIGH
-    return bps / 10000
-
-def adjust_for_slippage(price, volat_pct, action):
-    slip = estimate_slippage(volat_pct)
-    return price * (1 + slip) if action == "LONG" else price * (1 - slip)
-
-
-# ── Regime Classifier ─────────────────────────────────────────
-
 def calc_adx(highs, lows, closes, period=14):
-    if len(closes) < 2 * period + 1:
-        return 0
-    tr_list  = []
-    plus_dm  = []
-    minus_dm = []
+    if len(closes) < 2*period + 1: return 0
+    tr_list, plus_dm, minus_dm = [], [], []
     for i in range(1, len(closes)):
-        high_diff = highs[i] - highs[i - 1]
-        low_diff  = lows[i - 1] - lows[i]
-        plus_dm.append(max(high_diff, 0) if high_diff > low_diff else 0)
-        minus_dm.append(max(low_diff, 0) if low_diff > high_diff else 0)
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
-        )
-        tr_list.append(tr)
-
-    smoothed_tr    = sum(tr_list[:period])
-    smoothed_plus  = sum(plus_dm[:period])
-    smoothed_minus = sum(minus_dm[:period])
-    dx_values      = []
-
+        hd = highs[i]-highs[i-1]; ld = lows[i-1]-lows[i]
+        plus_dm.append(max(hd, 0) if hd > ld else 0)
+        minus_dm.append(max(ld, 0) if ld > hd else 0)
+        tr_list.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]),
+                           abs(lows[i]-closes[i-1])))
+    st=sum(tr_list[:period]); sp=sum(plus_dm[:period]); sm=sum(minus_dm[:period])
+    dx = []
     for i in range(period, len(tr_list)):
-        smoothed_tr    = smoothed_tr    - (smoothed_tr    / period) + tr_list[i]
-        smoothed_plus  = smoothed_plus  - (smoothed_plus  / period) + plus_dm[i]
-        smoothed_minus = smoothed_minus - (smoothed_minus / period) + minus_dm[i]
-        if smoothed_tr == 0:
-            continue
-        plus_di  = 100 * smoothed_plus  / smoothed_tr
-        minus_di = 100 * smoothed_minus / smoothed_tr
-        di_sum   = plus_di + minus_di
-        dx_values.append(0 if di_sum == 0 else 100 * abs(plus_di - minus_di) / di_sum)
-
-    if len(dx_values) < period:
-        return 0
-    adx = sum(dx_values[:period]) / period
-    for i in range(period, len(dx_values)):
-        adx = (adx * (period - 1) + dx_values[i]) / period
+        st=st-(st/period)+tr_list[i]
+        sp=sp-(sp/period)+plus_dm[i]
+        sm=sm-(sm/period)+minus_dm[i]
+        if st==0: continue
+        pdi=100*sp/st; mdi=100*sm/st; s=pdi+mdi
+        dx.append(0 if s==0 else 100*abs(pdi-mdi)/s)
+    if len(dx) < period: return 0
+    adx = sum(dx[:period]) / period
+    for i in range(period, len(dx)):
+        adx = (adx*(period-1) + dx[i]) / period
     return adx
 
-def classify_regime(highs, lows, closes, volat_pct):
-    if volat_pct > REGIME_VOLAT_HIGH:
-        return "VOLATILE"
-    recent_window = 50
-    h   = highs[-recent_window:]  if len(highs)   >= recent_window else highs
-    l   = lows[-recent_window:]   if len(lows)    >= recent_window else lows
-    c   = closes[-recent_window:] if len(closes)  >= recent_window else closes
-    adx = calc_adx(h, l, c)
-    if adx > REGIME_ADX_TREND:
-        recent = closes[-10:]
-        if recent[-1] > recent[0] * 1.005:
-            return "TRENDING_UP"
-        elif recent[-1] < recent[0] * 0.995:
-            return "TRENDING_DOWN"
-    return "RANGING"
+# ═══════════════════════════════════════════════════════════
+# EMA PULLBACK SIGNAL
+# ═══════════════════════════════════════════════════════════
 
-def regime_adjustment(regime, action):
-    if regime == "VOLATILE":
-        return 0.7
-    if regime == "RANGING":
-        return 1.0
-    if regime == "TRENDING_UP":
-        return 1.15 if action == "LONG" else 0.6
-    if regime == "TRENDING_DOWN":
-        return 1.15 if action == "SHORT" else 0.6
-    return 1.0
-
-
-# ── Shadow Mode ───────────────────────────────────────────────
-
-def log_shadow_trade(sym, sig, size, margin):
-    if "shadow_trades" not in S or not isinstance(S["shadow_trades"], list):
-        S["shadow_trades"] = []
-    entry = {
-        "ts":      int(time.time() * 1000),
-        "ts_iso":  datetime.now(timezone.utc).isoformat(),
-        "sym":     sym,
-        "action":  sig.get("action"),
-        "price":   sig.get("price"),
-        "conf":    sig.get("conf"),
-        "sl":      sig.get("sl"),
-        "tp1":     sig.get("tp1"),
-        "tp2":     sig.get("tp2"),
-        "tp3":     sig.get("tp3"),
-        "lev":     sig.get("lev"),
-        "size":    size,
-        "margin":  margin,
-        "regime":  sig.get("regime", "unknown"),
-        "rsi":     sig.get("rsi"),
-        "macd_h":  sig.get("macd_h"),
-        "stoch":   sig.get("stoch"),
-        "vol_r":   sig.get("vol_r"),
-        "volat":   sig.get("volat"),
-        "bull":    sig.get("bull"),
-        "bear":    sig.get("bear"),
-        "atr":     sig.get("atr"),
-        "reasons": sig.get("reasons", []),
-        "outcome": None,
-    }
-    S["shadow_trades"].append(entry)
-    if len(S["shadow_trades"]) > 200:
-        S["shadow_trades"] = S["shadow_trades"][-200:]
-    log.info(
-        f"[SHADOW] 👻 Would trade {sym} {sig['action']} @ ${sig['price']:.2f} "
-        f"(size={size}, margin=${margin}, conf={sig.get('conf')}%, regime={sig.get('regime')})"
-    )
-
-def print_shadow_summary():
-    shadow = S.get("shadow_trades", [])
-    if not shadow:
-        return
-    log.info("─── SHADOW MODE STATS ───")
-    log.info(f"  Total shadow trades: {len(shadow)}")
-    longs  = sum(1 for t in shadow if t.get("action") == "LONG")
-    shorts = sum(1 for t in shadow if t.get("action") == "SHORT")
-    log.info(f"  LONG: {longs}, SHORT: {shorts}")
-    regimes = {}
-    for t in shadow[-50:]:
-        r = t.get("regime", "?")
-        regimes[r] = regimes.get(r, 0) + 1
-    log.info(f"  Recent regimes: {regimes}")
-    with_outcomes = [t for t in shadow if t.get("outcome")]
-    if with_outcomes:
-        wins    = sum(1 for t in with_outcomes if t["outcome"].get("hit") == "tp")
-        losses  = sum(1 for t in with_outcomes if t["outcome"].get("hit") == "sl")
-        timeout = sum(1 for t in with_outcomes if t["outcome"].get("hit") == "timeout")
-        log.info(
-            f"  Outcomes: {wins} TP / {losses} SL / {timeout} timeout "
-            f"(of {len(with_outcomes)} resolved)"
-        )
-
-def update_shadow_outcomes():
-    shadow = S.get("shadow_trades", [])
-    if not shadow:
-        return
-    now_ms     = int(time.time() * 1000)
-    unresolved = [t for t in shadow if t.get("outcome") is None]
-
-    for trade in unresolved:
-        age_ms    = now_ms - trade.get("ts", now_ms)
-        age_hours = age_ms / 3_600_000
-        sym       = trade.get("sym")
-        if not sym:
-            continue
-        tick = pub_ticker(sym)
-        if not tick:
-            continue
-        try:
-            cur_price = float(tick.get("lastPr", 0))
-        except (ValueError, TypeError):
-            continue
-        if cur_price <= 0:
-            continue
-
-        entry  = trade.get("price", 0)
-        sl     = trade.get("sl", 0)
-        tp1    = trade.get("tp1", 0)
-        action = trade.get("action")
-        if entry <= 0 or sl <= 0:
-            continue
-
-        hit = None
-        if action == "LONG":
-            if cur_price <= sl:    hit = "sl"
-            elif cur_price >= tp1: hit = "tp"
-        elif action == "SHORT":
-            if cur_price >= sl:    hit = "sl"
-            elif cur_price <= tp1: hit = "tp"
-
-        if hit is None and age_hours >= 24:
-            hit = "timeout"
-
-        if hit:
-            pct = (
-                (cur_price - entry) / entry * 100
-                if action == "LONG"
-                else (entry - cur_price) / entry * 100
-            )
-            trade["outcome"] = {
-                "hit":         hit,
-                "exit_price":  cur_price,
-                "pct_move":    pct,
-                "hold_hours":  age_hours,
-                "resolved_ts": now_ms,
-            }
-            log.info(
-                f"[SHADOW] 📊 Resolved {sym} {action} @ ${entry:.2f} → ${cur_price:.2f} "
-                f"({pct:+.2f}%) hit={hit} held={age_hours:.1f}h"
-            )
-
-
-# ── Compounding ───────────────────────────────────────────────
-# FIX-9: restructured drawdown guard for clarity; logic unchanged.
-
-def compound_size(bal, price, lev, conf, sym, side=None):
-    margin = bal * COMPOUND_PCT
-    if S["loss_streak"] >= 3:
-        margin *= 0.5
-        log.info(f"[COMPOUND] Loss streak {S['loss_streak']} — size 50%")
-    elif S["loss_streak"] == 2:
-        margin *= 0.7
-    if S["win_streak"] >= 3:
-        margin *= 1.15
-    elif S["win_streak"] >= 2:
-        margin *= 1.08
-    if conf >= 90:   margin *= 1.2
-    elif conf >= 85: margin *= 1.1
-    elif conf >= 80: margin *= 1.05
-
-    # Drawdown reduction (FIX-9: guard peak_bal > 0 clearly)
-    peak = S.get("peak_bal", 0)
-    if peak > 0:
-        dd = (peak - bal) / peak
-        if dd > MAX_DRAWDOWN:
-            margin *= 0.4
-            log.warning(f"[COMPOUND] Drawdown {dd*100:.1f}% — size 40%")
-        elif dd > 0.06:
-            margin *= 0.7
-
-    if is_correlated_with_open(sym, new_side=side):
-        margin *= CORR_REDUCTION
-        log.info(
-            f"[COMPOUND] {sym} correlated with open position — "
-            f"size {CORR_REDUCTION*100:.0f}%"
-        )
-
-    margin       = min(margin, bal * 0.40)
-    dynamic_min  = max(3.0, bal * 0.08)
-    if bal < dynamic_min:
-        log.warning(f"[COMPOUND] {sym} balance ${bal:.2f} < min ${dynamic_min:.2f} — skip")
-        return 0, 0
-    if margin < dynamic_min:
-        log.warning(
-            f"[COMPOUND] {sym} margin ${margin:.2f} < ${dynamic_min:.2f} "
-            "(dynamic min) — skip"
-        )
-        return 0, 0
-    if sym not in SYMBOL_SPECS:
-        log.error(f"[COMPOUND] Unknown symbol {sym} — no specs defined, skip")
-        return 0, 0
-
-    spec     = SYMBOL_SPECS[sym]
-    raw_size = (margin * lev) / price
-    factor   = 10 ** spec["precision"]
-    size     = int(raw_size * factor) / factor
-    if size < spec["min_size"]:
-        log.warning(f"[COMPOUND] {sym} size {size} < min {spec['min_size']}")
-        return 0, 0
-    return size, round(margin, 2)
-
-
-# ── Signal Generation ─────────────────────────────────────────
-
-def generate_signal(sym, tick, cdata, fund_rate):
-    if not cdata or len(cdata) < 60:
-        return None
-    try:
-        last_ts_ms = int(cdata[-1][0])
-        now_ms     = int(time.time() * 1000)
-        age_min    = (now_ms - last_ts_ms) / 60000
-        if age_min > 30:
-            log.warning(f"[{sym}] Stale candles (age {age_min:.0f}min) — skip signal")
-            return None
-    except (ValueError, TypeError, IndexError):
-        log.warning(f"[{sym}] Cannot parse candle timestamp — skip signal")
-        return None
-
-    # FIX-5: validate candle integrity before any indicator computation
-    ok, reason = validate_candles(cdata, gran_label="15m", min_bars=60)
-    if not ok:
-        log.warning(f"[{sym}] Candle validation failed: {reason} — skip signal")
-        return None
-
-    _, highs, lows, closes, vols = safe_extract_ohlcv(cdata)
-    if not closes:
-        return None
-
-    price = float(tick.get("lastPr", closes[-1]))
-    h24   = float(tick.get("high24h", price))
-    l24   = float(tick.get("low24h", price))
-    chg   = float(tick.get("change24h", 0)) * 100
-    e9    = ema(closes, 9)
-    e21   = ema(closes, 21)
-    e50   = ema(closes, 50)
-    e100  = ema(closes, 100)
-    e200  = ema(closes, 200) if len(closes) >= 200 else None
-    r_now  = calc_rsi(closes)
-    r_prev = calc_rsi(closes[:-3])
-    ml, ms, mh = calc_macd(closes)
-    bbu, bbm, bbl = calc_bb(closes)
-    atr_v  = calc_atr(highs, lows, closes)
-    sk     = calc_stoch(highs, lows, closes)
-    vwap_v = calc_vwap(highs, lows, closes, vols)
-    vol_avg = sum(vols[-20:]) / 20 if len(vols) >= 20 else vols[-1]
-    vol_r   = vols[-1] / vol_avg if vol_avg > 0 else 1
-    volat   = (atr_v / price) * 100
-    if volat > MAX_VOLAT:
-        log.warning(f"[{sym}] Volatility {volat:.1f}% — skip")
-        return None
-    regime = classify_regime(highs, lows, closes, volat)
-    log.info(f"[REGIME] {sym} → {regime} (volat={volat:.1f}%, ADX-based)")
-    mtf_b, mtf_br, tf_map = mtf_analysis(sym, primary_15m=cdata)
-    bull, bear = 0, 0
-    reasons    = []
-    if e9 > e21 > e50 > e100:
-        bull += 5; reasons.append("✅ Full EMA stack bullish")
-    elif e9 > e21 > e50:
-        bull += 4; reasons.append("✅ EMA uptrend 9>21>50")
-    elif e9 > e21:
-        bull += 2; reasons.append("✅ EMA bullish 9>21")
-    elif e9 < e21 < e50 < e100:
-        bear += 5; reasons.append("🔴 Full EMA stack bearish")
-    elif e9 < e21 < e50:
-        bear += 4; reasons.append("🔴 EMA downtrend 9<21<50")
-    elif e9 < e21:
-        bear += 2; reasons.append("🔴 EMA bearish 9<21")
-    if e200 is not None:
-        if price > e200: bull += 3; reasons.append("✅ Above EMA200")
-        else:            bear += 3; reasons.append("🔴 Below EMA200")
-    rsi_up = r_now > r_prev
-    if r_now < 25:   bull += 4; reasons.append(f"✅ RSI extreme oversold {r_now:.0f}")
-    elif r_now < 35: bull += 3; reasons.append(f"✅ RSI oversold {r_now:.0f}")
-    elif r_now < 45 and rsi_up: bull += 2; reasons.append(f"✅ RSI recovering {r_now:.0f}")
-    elif r_now > 75: bear += 4; reasons.append(f"🔴 RSI extreme overbought {r_now:.0f}")
-    elif r_now > 65: bear += 3; reasons.append(f"🔴 RSI overbought {r_now:.0f}")
-    elif r_now > 55 and not rsi_up: bear += 2; reasons.append(f"🔴 RSI weakening {r_now:.0f}")
-    elif 48 < r_now < 58: bull += 1
-    if mh > 0 and ml > ms and ml > 0:
-        bull += 3; reasons.append("✅ MACD bullish above zero")
-    elif mh > 0 and ml > ms:
-        bull += 2; reasons.append("✅ MACD bullish cross")
-    elif mh > 0: bull += 1
-    elif mh < 0 and ml < ms and ml < 0:
-        bear += 3; reasons.append("🔴 MACD bearish below zero")
-    elif mh < 0 and ml < ms:
-        bear += 2; reasons.append("🔴 MACD bearish cross")
-    elif mh < 0: bear += 1
-    bb_range = bbu - bbl
-    bb_pct   = (price - bbl) / bb_range if bb_range > 0 else 0.5
-    if price < bbl:     bull += 3; reasons.append("✅ Below BB lower")
-    elif bb_pct < 0.2:  bull += 2; reasons.append("✅ Near BB lower support")
-    elif price > bbu:   bear += 3; reasons.append("🔴 Above BB upper")
-    elif bb_pct > 0.8:  bear += 2; reasons.append("🔴 Near BB upper resistance")
-    if sk < 15:   bull += 3; reasons.append(f"✅ Stoch extreme oversold {sk:.0f}")
-    elif sk < 25: bull += 2; reasons.append(f"✅ Stoch oversold {sk:.0f}")
-    elif sk > 85: bear += 3; reasons.append(f"🔴 Stoch extreme overbought {sk:.0f}")
-    elif sk > 75: bear += 2; reasons.append(f"🔴 Stoch overbought {sk:.0f}")
-    if price > vwap_v * 1.002: bull += 2; reasons.append("✅ Above VWAP")
-    elif price < vwap_v * 0.998: bear += 2; reasons.append("🔴 Below VWAP")
-    if vol_r > 2.5 and chg > 0:
-        bull += 3; reasons.append(f"✅ Huge vol surge bullish {vol_r:.1f}x")
-    elif vol_r > 1.8 and chg > 0:
-        bull += 2; reasons.append(f"✅ Vol surge bullish {vol_r:.1f}x")
-    elif vol_r > 2.5 and chg < 0:
-        bear += 3; reasons.append(f"🔴 Huge vol surge bearish {vol_r:.1f}x")
-    elif vol_r > 1.8 and chg < 0:
-        bear += 2; reasons.append(f"🔴 Vol surge bearish {vol_r:.1f}x")
-    if fund_rate > 0.003:
-        bear += 3; reasons.append(f"🔴 Extreme funding {fund_rate*100:.3f}%")
-    elif fund_rate > 0.001: bear += 2
-    elif fund_rate < -0.003:
-        bull += 3; reasons.append(f"✅ Extreme negative funding {fund_rate*100:.3f}%")
-    elif fund_rate < -0.001: bull += 2
-    rng = h24 - l24
-    if rng > 0:
-        pos = (price - l24) / rng
-        if pos < 0.10:   bull += 3; reasons.append("✅ At 24h low support")
-        elif pos < 0.25: bull += 2
-        elif pos > 0.90: bear += 3; reasons.append("🔴 At 24h high resistance")
-        elif pos > 0.75: bear += 2
-    tf_str = " ".join(f"{k}:{v}" for k, v in tf_map.items())
-    log.info(f"[MTF] {tf_str}")
-    if mtf_b > mtf_br * 1.8:
-        bull += 5; reasons.append("✅ ALL timeframes bullish!")
-    elif mtf_b > mtf_br * 1.3:
-        bull += 3; reasons.append("✅ Most TF bullish")
-    elif mtf_br > mtf_b * 1.8:
-        bear += 5; reasons.append("🔴 ALL timeframes bearish!")
-    elif mtf_br > mtf_b * 1.3:
-        bear += 3; reasons.append("🔴 Most TF bearish")
-    if chg > 4:    bull += 2
-    elif chg > 2:  bull += 1
-    elif chg < -4: bear += 2
-    elif chg < -2: bear += 1
-    sentiment = get_sentiment() or {}
-    fg        = sentiment.get("fg_value")
-    if fg is not None:
-        if fg <= 20:   bull += 4; reasons.append(f"✅ Extreme Fear {fg} — buy opportunity")
-        elif fg <= 35: bull += 2; reasons.append(f"✅ Market fearful {fg}")
-        elif fg >= 80: bear += 4; reasons.append(f"🔴 Extreme Greed {fg} — caution!")
-        elif fg >= 65: bear += 2; reasons.append(f"🔴 Market greedy {fg}")
-    news_sent = sentiment.get("news_sent")
-    if news_sent is not None:
-        if news_sent > 30:    bull += 3; reasons.append("✅ News very bullish")
-        elif news_sent > 10:  bull += 1
-        elif news_sent < -30: bear += 3; reasons.append("🔴 News very bearish")
-        elif news_sent < -10: bear += 1
-    if sym == "ETHUSDT":
-        btc_dom = sentiment.get("btc_dom")
-        if btc_dom is not None:
-            if btc_dom > 55:   bear += 1; reasons.append(f"🔴 BTC dominance high {btc_dom:.1f}%")
-            elif btc_dom < 45: bull += 1; reasons.append(f"✅ Alt season BTC.D {btc_dom:.1f}%")
-    total    = bull + bear
-    if total == 0:
-        return None
-    bull_pct = (bull / total) * 100
-    bear_pct = 100 - bull_pct
-    if bull >= 12 and bull_pct >= 65:
-        action, side, hold = "LONG", "buy", "long"
-        base_conf = bull_pct
-        if bull >= 25: base_conf += 5
-        elif bull >= 20: base_conf += 2
-        conf = min(97, int(base_conf))
-    elif bear >= 12 and bear_pct >= 65:
-        action, side, hold = "SHORT", "sell", "short"
-        base_conf = bear_pct
-        if bear >= 25: base_conf += 5
-        elif bear >= 20: base_conf += 2
-        conf = min(97, int(base_conf))
-    else:
-        action, side, hold = "HOLD", "none", "none"
-        conf = 50
-
-    regime_mult = regime_adjustment(regime, action)
-    if regime_mult != 1.0:
-        old_conf = conf
-        conf = min(97, max(0, int(conf * regime_mult)))
-        log.info(f"[REGIME] {regime}: conf {old_conf}% × {regime_mult:.2f} = {conf}%")
-
-    if volat > 5:     lev = 1
-    elif volat > 3.5: lev = 2
-    elif volat > 2.5: lev = 3
-    elif volat > 1.5: lev = 4 if conf >= 80 else 3
-    elif conf >= 92:  lev = min(MAX_LEVERAGE, 10)
-    elif conf >= 87:  lev = min(MAX_LEVERAGE, 8)
-    elif conf >= 82:  lev = min(MAX_LEVERAGE, 6)
-    elif conf >= 75:  lev = min(MAX_LEVERAGE, 5)
-    else:             lev = min(MAX_LEVERAGE, 3)
-
-    sl_d  = atr_v * SL_MULT
-    tp1_d = atr_v * TP1_MULT
-    tp2_d = atr_v * TP2_MULT
-    tp3_d = atr_v * TP3_MULT
-    trail = atr_v * TRAIL_MULT
-
-    if action in ("LONG", "SHORT"):
-        adjusted_entry = adjust_for_slippage(price, volat, action)
-        slip_bps = abs(adjusted_entry - price) / price * 10000
-        log.info(f"[SLIPPAGE] Expected entry slippage: {slip_bps:.1f} bps")
-    else:
-        adjusted_entry = price
-
-    if action == "LONG":
-        sl, tp1, tp2, tp3 = (
-            adjusted_entry - sl_d,
-            adjusted_entry + tp1_d,
-            adjusted_entry + tp2_d,
-            adjusted_entry + tp3_d,
-        )
-    elif action == "SHORT":
-        sl, tp1, tp2, tp3 = (
-            adjusted_entry + sl_d,
-            adjusted_entry - tp1_d,
-            adjusted_entry - tp2_d,
-            adjusted_entry - tp3_d,
-        )
-    else:
-        sl = tp1 = tp2 = tp3 = price
-
-    if sl <= 0 or tp3 <= 0:
-        log.warning(
-            f"[{sym}] Invalid SL/TP prices (sl=${sl}, tp3=${tp3}) — skip signal"
-        )
-        return None
-    if abs(sl - price) / price > 0.30:
-        log.warning(
-            f"[{sym}] SL too far from price ({abs(sl-price)/price*100:.0f}%) — skip"
-        )
-        return None
-
-    return {
-        "sym":    sym,    "asset": sym.replace("USDT", ""),
-        "action": action, "side":  side,  "hold": hold,
-        "conf":   conf,   "price": price,
-        "sl":     sl,     "tp1":   tp1,   "tp2": tp2,  "tp3": tp3,
-        "lev":    lev,    "rr":    f"1:{round(tp2_d/sl_d,1)}",
-        "atr":    atr_v,  "trail": trail,
-        "rsi":    r_now,  "macd_h": mh,   "stoch": sk,
-        "vol_r":  vol_r,  "volat":  volat,
-        "bull":   bull,   "bear":   bear,
-        "regime": regime,
-        "reasons": reasons[:5],
-    }
-
-
-# ── Funding Rate Mean Reversion Signal (v6.5) ─────────────────
-
-def funding_signal(sym, tick, cdata_15m):
+def generate_signal(sym, candles, live_price=0):
     """
-    v6.5: Funding Rate Mean Reversion strategy.
+    EMA Pullback Strategy Signal.
 
-    Thesis: When funding rates hit extremes, crowded positions unwind.
-    Take the opposite side, collect funding while waiting for reversion.
+    [FIX-5] All indicators computed on CLOSED candles only — the
+    currently-forming candle is dropped, so EMAs/RSI don't repaint
+    mid-candle and the volume filter compares a completed candle
+    against completed-candle averages.
 
-    SHORT setup (fade crowded longs):
-      1. Current funding > +0.03%
-      2. Funding positive for 3+ consecutive periods (24h+)
-      3. Price > 4H VWAP
-      4. 4H RSI > 65
-      5. No major support within 1.5× ATR below
-      6. Not in volatility spike (event proxy)
-
-    LONG setup: mirror (funding < -0.03%, negative 24h+, price < VWAP, RSI < 35)
-
-    Returns signal dict or None.
+    LONG:
+      1. Uptrend:  EMA9 > EMA21 > EMA50
+      2. Pullback: price within EMA_PULL_TOL of EMA21
+      3. RSI:      35-65
+      4. ADX:      >= MIN_ADX
+      5. Volume:   last CLOSED candle vol > 0.7x prior 20-candle avg
+    SHORT: mirror.
     """
-    try:
-        price = float(tick.get("lastPr", 0))
-    except (ValueError, TypeError):
+    if len(candles) < 61:
+        log.warning(f"[{sym}] Not enough candles ({len(candles)})")
         return None
+
+    closed = candles[:-1]  # [FIX-5] drop the live, incomplete candle
+
+    closes = [c["close"] for c in closed]
+    highs  = [c["high"]  for c in closed]
+    lows   = [c["low"]   for c in closed]
+    vols   = [c["vol"]   for c in closed]
+
+    price = live_price if live_price > 0 else closes[-1]
     if price <= 0:
         return None
 
-    # ── 1. Current funding rate ──
-    fund_rate, fund_mins = pub_funding(sym)
-    if abs(fund_rate) < FR_THRESHOLD:
-        log.info(f"[FR] {sym} funding {fund_rate*100:.4f}% < threshold "
-                 f"{FR_THRESHOLD*100:.2f}% — no setup")
+    e9  = ema(closes, EMA_FAST)
+    e21 = ema(closes, EMA_MID)
+    e50 = ema(closes, EMA_SLOW)
+
+    atr = calc_atr(highs, lows, closes)
+    if atr <= 0:
         return None
 
-    # ── 2. Funding history (consecutive check) ──
-    # Fetch extra history so we can measure the FULL streak length for sizing
-    history = fetch_funding_history(sym, periods=10)
-    if len(history) < FR_CONSECUTIVE:
-        log.warning(f"[FR] {sym} insufficient funding history "
-                    f"({len(history)}/{FR_CONSECUTIVE}) — skip")
-        return None
+    rsi = calc_rsi(closes)
+    adx = calc_adx(highs, lows, closes)
 
-    funding_positive = fund_rate > 0
-    if not check_funding_consecutive(history, want_positive=funding_positive):
-        log.info(f"[FR] {sym} funding not consistent for {FR_CONSECUTIVE} periods "
-                 f"(history: {[f'{r*100:.3f}%' for r in history[-FR_CONSECUTIVE:]]}) — skip")
-        return None
+    # [FIX-5] last CLOSED candle vs avg of the 20 before it
+    avg_vol = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else vols[-1]
+    vol_ok  = vols[-1] > avg_vol * 0.7
 
-    # Count actual streak length (consecutive same-sign periods from most recent)
-    streak = count_funding_streak(history, want_positive=funding_positive)
+    dist_from_e21 = abs(price - e21) / e21
+    px_prec = SYMBOL_SPECS.get(sym, {}).get("price_precision", 2)
 
-    # ── 3. 15m ATR + volatility spike check (event proxy) ──
-    opens, highs, lows, closes, vols = safe_extract_ohlcv(cdata_15m)
-    if not closes or len(closes) < 20:
-        log.warning(f"[FR] {sym} insufficient 15m data — skip")
-        return None
-    atr_v = calc_atr(highs, lows, closes)
-    if atr_v <= 0:
-        return None
-    # Volatility spike: last 4 candles (1h) range vs price
-    recent_range = max(highs[-4:]) - min(lows[-4:])
-    volat_1h = (recent_range / price) * 100
-    if volat_1h > FR_VOLAT_SPIKE:
-        log.warning(f"[FR] {sym} volatility spike {volat_1h:.1f}% > "
-                    f"{FR_VOLAT_SPIKE}% (event?) — skip")
-        return None
+    log.info(f"[{sym}] Price:${price:.2f} | E9:${e9:.2f} E21:${e21:.2f} E50:${e50:.2f}")
+    log.info(f"[{sym}] RSI:{rsi:.0f} | ADX:{adx:.0f} | ATR:${atr:.2f} | "
+             f"Dist21:{dist_from_e21*100:.2f}%")
 
-    # ── 4. 4H data: VWAP + RSI ──
-    data_4h = fetch_4h_data(sym)
-    if not data_4h:
-        log.warning(f"[FR] {sym} 4H data unavailable — skip")
-        return None
-    vwap_4h = calc_vwap_4h(data_4h["highs"], data_4h["lows"],
-                           data_4h["closes"], data_4h["volumes"])
-    rsi_4h = calc_rsi(data_4h["closes"])
-    if vwap_4h <= 0:
-        return None
+    # ── LONG setup ──
+    if (e9 > e21 > e50 and
+        dist_from_e21 <= EMA_PULL_TOL and
+        RSI_MIN <= rsi <= RSI_MAX and
+        adx >= MIN_ADX and
+        vol_ok):
 
-    # ── 4b. TREND FILTER (reviewer suggestion) ──
-    # Funding strategy FADES the crowd. But fading a STRONG trend = getting run over.
-    # If 4H ADX shows a powerful trend, the "crowded" side may keep winning.
-    # Block counter-trend fades when ADX is high.
-    adx_4h = calc_adx(data_4h["highs"], data_4h["lows"], data_4h["closes"])
-    if adx_4h > FR_TREND_ADX:
-        # Strong trend present — determine direction
-        recent = data_4h["closes"][-10:]
-        trending_up = recent[-1] > recent[0] * 1.005
-        trending_down = recent[-1] < recent[0] * 0.995
-        # funding_positive → we'd SHORT. Block if strong uptrend (don't fade up-trend)
-        if funding_positive and trending_up:
-            log.info(f"[FR] {sym} SHORT blocked: strong uptrend "
-                     f"(4H ADX {adx_4h:.0f} > {FR_TREND_ADX}) — don't fade trend")
-            return None
-        # funding negative → we'd LONG. Block if strong downtrend
-        if (not funding_positive) and trending_down:
-            log.info(f"[FR] {sym} LONG blocked: strong downtrend "
-                     f"(4H ADX {adx_4h:.0f} > {FR_TREND_ADX}) — don't fade trend")
-            return None
+        # [FIX-6/13] Never place a buy limit above or at market —
+        # keep it at least PASSIVE_BUF below so it always posts as maker
+        limit_px = round(min(e21, price * (1 - PASSIVE_BUF)), px_prec)
+        sl  = limit_px - atr * ATR_SL_MULT
+        tp1 = limit_px + atr * ATR_TP_MULT
+        tp2 = limit_px + atr * ATR_TP2_MULT
 
-    # ── 5. Determine setup direction ──
-    action = side = hold = None
+        log.info(f"[{sym}] ✅ LONG PULLBACK | Limit:${limit_px} "
+                 f"SL:${sl:.2f} TP1:${tp1:.2f} TP2:${tp2:.2f}")
+        return {
+            "sym": sym, "action": "LONG", "side": "buy", "hold": "long",
+            "price": price, "limit_price": limit_px,
+            "sl": sl, "tp1": tp1, "tp2": tp2,
+            "atr": atr, "rsi": rsi, "adx": adx,
+            "reasons": [
+                f"✅ Uptrend: E9({e9:.0f}) > E21({e21:.0f}) > E50({e50:.0f})",
+                f"✅ Pullback to EMA21 ({dist_from_e21*100:.1f}% away)",
+                f"✅ RSI {rsi:.0f} (continuation zone)",
+                f"✅ ADX {adx:.0f} (trend confirmed)",
+            ]
+        }
 
-    if funding_positive:
-        # SHORT setup — fade crowded longs
-        # Need: price > VWAP (longs trapped high) AND RSI > 65 (overextended)
-        if price <= vwap_4h:
-            log.info(f"[FR] {sym} SHORT blocked: price ${price:.2f} "
-                     f"not above 4H VWAP ${vwap_4h:.2f}")
-            return None
-        if rsi_4h <= FR_RSI_HIGH:
-            log.info(f"[FR] {sym} SHORT blocked: 4H RSI {rsi_4h:.0f} "
-                     f"not > {FR_RSI_HIGH}")
-            return None
-        # Check no major support within 1.5× ATR below
-        support_zone = price - (FR_SUPPORT_ATR * atr_v)
-        recent_low = min(lows[-20:])
-        if recent_low > support_zone:
-            log.info(f"[FR] {sym} SHORT blocked: support at ${recent_low:.2f} "
-                     f"within 1.5×ATR")
-            return None
-        action, side, hold = "SHORT", "sell", "short"
+    # ── SHORT setup ──
+    if (e9 < e21 < e50 and
+        dist_from_e21 <= EMA_PULL_TOL and
+        RSI_MIN <= rsi <= RSI_MAX and
+        adx >= MIN_ADX and
+        vol_ok):
+
+        # [FIX-6/13] Never place a sell limit below or at market
+        limit_px = round(max(e21, price * (1 + PASSIVE_BUF)), px_prec)
+        sl  = limit_px + atr * ATR_SL_MULT
+        tp1 = limit_px - atr * ATR_TP_MULT
+        tp2 = limit_px - atr * ATR_TP2_MULT
+
+        log.info(f"[{sym}] ✅ SHORT PULLBACK | Limit:${limit_px} "
+                 f"SL:${sl:.2f} TP1:${tp1:.2f} TP2:${tp2:.2f}")
+        return {
+            "sym": sym, "action": "SHORT", "side": "sell", "hold": "short",
+            "price": price, "limit_price": limit_px,
+            "sl": sl, "tp1": tp1, "tp2": tp2,
+            "atr": atr, "rsi": rsi, "adx": adx,
+            "reasons": [
+                f"✅ Downtrend: E9({e9:.0f}) < E21({e21:.0f}) < E50({e50:.0f})",
+                f"✅ Bounce to EMA21 ({dist_from_e21*100:.1f}% away)",
+                f"✅ RSI {rsi:.0f} (continuation zone)",
+                f"✅ ADX {adx:.0f} (trend confirmed)",
+            ]
+        }
+
+    trend = "UP" if e9 > e21 else "DOWN" if e9 < e21 else "FLAT"
+    log.info(f"[{sym}] HOLD | Trend:{trend} | "
+             f"EMA aligned:{e9>e21>e50 or e9<e21<e50} | "
+             f"At pullback:{dist_from_e21<=EMA_PULL_TOL} | "
+             f"ADX ok:{adx>=MIN_ADX}")
+    return None
+
+# ═══════════════════════════════════════════════════════════
+# ORDER MANAGEMENT
+# ═══════════════════════════════════════════════════════════
+
+def set_leverage(sym, lev):
+    for hold_side in ["long", "short"]:
+        res = call("POST", "/api/v2/mix/account/set-leverage",
+                   body={"symbol": sym, "productType": PRODUCT_TYPE,
+                         "marginCoin": "USDT", "leverage": str(lev),
+                         "holdSide": hold_side})
+        if not res or res.get("code") not in ["00000", "40919"]:
+            log.error(f"[LEV] {sym} {hold_side} failed: {res}")
+            return False
+    return True
+
+def place_limit_order(sym, side, size, price, preset_sl=None):
+    """
+    LIMIT entry order.
+    [FIX-7] presetStopLossPrice rides on the order itself — the
+    exchange arms the SL the instant the order fills. No naked window
+    even if the bot crashes or Railway restarts mid-cycle.
+    """
+    spec = SYMBOL_SPECS.get(sym, {"price_precision": 2})
+    px = round(price, spec["price_precision"])
+    body = {"symbol": sym, "productType": PRODUCT_TYPE,
+            "marginCoin": "USDT", "side": side,
+            "tradeSide": "open", "orderType": "limit",
+            "price": str(px), "size": str(size),
+            "force": "gtc"}
+    if preset_sl:
+        body["presetStopLossPrice"] = str(round(preset_sl, spec["price_precision"]))
+    res = call("POST", "/api/v2/mix/order/place-order", body=body)
+    if res and res.get("code") == "00000":
+        oid = res.get("data", {}).get("orderId", "N/A")
+        log.info(f"[ORDER] LIMIT {sym} {side.upper()} {size} @ ${px} "
+                 f"presetSL:{preset_sl} | ID:{oid}")
+        return oid
+    log.error(f"[ORDER] Limit order failed: {res}")
+    return None
+
+def place_market_order(sym, side, size, trade_side="open"):
+    """Market order — only for emergency closes."""
+    res = call("POST", "/api/v2/mix/order/place-order",
+               body={"symbol": sym, "productType": PRODUCT_TYPE,
+                     "marginCoin": "USDT", "side": side,
+                     "tradeSide": trade_side, "orderType": "market",
+                     "size": str(size), "force": "ioc"})
+    if res and res.get("code") == "00000":
+        log.info(f"[ORDER] MARKET {sym} {side.upper()} {size} ({trade_side})")
+        return res
+    log.error(f"[ORDER] Market order failed: {res}")
+    return None
+
+def place_plan_order(sym, plan_type, trigger_px, hold_side, size):
+    """
+    Place SL or TP plan order.
+    [FIX-14] Returns the plan orderId (truthy) on success, None on
+    failure — so callers can later cancel THIS specific order instead
+    of nuking everything with cancel-all.
+    """
+    spec = SYMBOL_SPECS.get(sym, {"price_precision": 2})
+    px = round(trigger_px, spec["price_precision"])
+    res = call("POST", "/api/v2/mix/order/place-tpsl-order",
+               body={"symbol": sym, "productType": PRODUCT_TYPE,
+                     "marginCoin": "USDT", "planType": plan_type,
+                     "triggerPrice": str(px), "holdSide": hold_side,
+                     "size": str(size), "triggerType": "mark_price"})
+    if res and res.get("code") == "00000":
+        oid = (res.get("data") or {}).get("orderId", "")
+        log.info(f"[PLAN] {plan_type} @ ${px} | ID:{oid}")
+        return oid or "unknown"
+    log.error(f"[PLAN] {plan_type} failed: {res}")
+    return None
+
+def get_loss_plan_ids(sym, hold_side):
+    """
+    [FIX-14] Fetch the orderIds of currently-pending loss plans
+    (SL trigger orders) for a symbol+side — including the SL that
+    Bitget auto-created from presetStopLossPrice (which we never
+    placed ourselves and so have no stored ID for).
+    Logs the raw response once so the real schema can be verified
+    in shadow/early-live runs.
+    """
+    res = call("GET", "/api/v2/mix/order/orders-plan-pending",
+               params={"symbol": sym, "productType": PRODUCT_TYPE,
+                       "planType": "profit_loss"})
+    ids = []
+    if res and res.get("code") == "00000":
+        data = res.get("data") or {}
+        orders = data.get("entrustedList") or data.get("orderList") or []
+        log.info(f"[PLAN] raw pending plans {sym}: {json.dumps(orders)[:400]}")
+        for o in orders:
+            try:
+                ptype = (o.get("planType") or "").lower()
+                oside = (o.get("holdSide") or "").lower()
+                if "loss" in ptype and (not oside or oside == hold_side):
+                    oid = o.get("orderId")
+                    if oid:
+                        ids.append(oid)
+            except Exception:
+                continue
     else:
-        # LONG setup — fade crowded shorts
-        if price >= vwap_4h:
-            log.info(f"[FR] {sym} LONG blocked: price ${price:.2f} "
-                     f"not below 4H VWAP ${vwap_4h:.2f}")
-            return None
-        if rsi_4h >= FR_RSI_LOW:
-            log.info(f"[FR] {sym} LONG blocked: 4H RSI {rsi_4h:.0f} "
-                     f"not < {FR_RSI_LOW}")
-            return None
-        resistance_zone = price + (FR_SUPPORT_ATR * atr_v)
-        recent_high = max(highs[-20:])
-        if recent_high < resistance_zone:
-            log.info(f"[FR] {sym} LONG blocked: resistance at ${recent_high:.2f} "
-                     f"within 1.5×ATR")
-            return None
-        action, side, hold = "LONG", "buy", "long"
+        log.warning(f"[PLAN] pending-plan query failed: {res}")
+    return ids
 
-    # ── 6. Build signal with SL/TP ──
-    sl_d = atr_v * FR_SL_ATR_MULT
-    if action == "SHORT":
-        sl  = price + sl_d
-        tp2 = vwap_4h  # TP2 = price reverts to VWAP
-        tp3 = vwap_4h - atr_v  # runner beyond VWAP
-    else:
-        sl  = price - sl_d
-        tp2 = vwap_4h
-        tp3 = vwap_4h + atr_v
+def cancel_plan_order_by_id(sym, order_id):
+    """[FIX-14] Cancel ONE specific trigger order (not cancel-all)."""
+    res = call("POST", "/api/v2/mix/order/cancel-plan-order",
+               body={"symbol": sym, "productType": PRODUCT_TYPE,
+                     "marginCoin": "USDT", "planType": "profit_loss",
+                     "orderIdList": [{"orderId": str(order_id)}]})
+    ok = bool(res and res.get("code") == "00000")
+    if not ok:
+        log.warning(f"[PLAN] cancel {order_id} failed: {res}")
+    return ok
 
-    log.info(f"[FR] {sym} ✅ {action} setup | funding={fund_rate*100:.4f}% "
-             f"| 4H RSI={rsi_4h:.0f} | VWAP=${vwap_4h:.2f} | price=${price:.2f}")
+def cancel_all_plan_orders(sym):
+    call("POST", "/api/v2/mix/order/cancel-all-trigger-orders",
+         body={"symbol": sym, "productType": PRODUCT_TYPE, "marginCoin": "USDT"})
 
-    return {
-        "sym": sym, "asset": sym.replace("USDT", ""),
-        "action": action, "side": side, "hold": hold,
-        "conf": 80,  # fixed conf for funding strategy (no scoring)
-        "price": price,
-        "sl": sl,
-        "tp1": None,  # TP1 is funding-normalize, not price-based
-        "tp2": tp2,
-        "tp3": tp3,
-        "lev": FR_MAX_LEVERAGE,
-        "rr": "funding",
-        "atr": atr_v,
-        "trail": atr_v,
-        "vwap_4h": vwap_4h,
-        "rsi_4h": rsi_4h,
-        "entry_funding": fund_rate,
-        "funding_streak": streak,
-        "regime": "FUNDING",
-        "strategy": "funding_reversion",
-        "reasons": [
-            f"✅ Funding {fund_rate*100:.3f}% extreme",
-            f"✅ {streak} periods consistent (streak)",
-            f"✅ 4H RSI {rsi_4h:.0f}",
-            f"✅ Price vs VWAP confirmed",
-        ],
-    }
+def cancel_limit_order(sym, order_id):
+    call("POST", "/api/v2/mix/order/cancel-order",
+         body={"symbol": sym, "productType": PRODUCT_TYPE,
+               "marginCoin": "USDT", "orderId": order_id})
 
+def check_limit_order_filled(sym, order_id):
+    res = call("GET", "/api/v2/mix/order/detail",
+               params={"symbol": sym, "productType": PRODUCT_TYPE,
+                       "orderId": order_id})
+    if res and res.get("data"):
+        status = res["data"].get("status", "")
+        size   = float(res["data"].get("baseVolume", 0))
+        price  = float(res["data"].get("priceAvg", 0) or 0)
+        return status, size, price
+    return "unknown", 0, 0
 
-# ── Position Management ───────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# POSITION SIZING  (true risk-based)
+# ═══════════════════════════════════════════════════════════
+
+def calc_position_size(bal, price, sl_price, lev, sym):
+    """
+    TRUE risk-based sizing:
+      size = risk_usd / SL_distance
+    This guarantees that if SL hits, the loss is EXACTLY risk_usd —
+    regardless of ATR/volatility.
+
+    Returns (size, margin_required, actual_risk_usd).
+    """
+    spec = SYMBOL_SPECS.get(sym, {"min_size": 0.0001, "precision": 4})
+
+    sl_distance = abs(price - sl_price)
+    if sl_distance <= 0:
+        log.error(f"[SIZE] {sym} invalid SL distance — skip")
+        return 0, 0, 0
+
+    risk_usd = bal * RISK_PCT
+
+    # Drawdown reduction
+    if S["peak_bal"] > 0:
+        dd = (S["peak_bal"] - bal) / S["peak_bal"]
+        if dd > MAX_DRAWDOWN:
+            risk_usd *= 0.5
+            log.warning(f"[SIZE] Drawdown {dd*100:.1f}% → risk halved")
+        elif dd > 0.08:
+            risk_usd *= 0.75
+
+    # Loss streak reduction
+    if S["loss_streak"] >= 3:
+        risk_usd *= 0.6
+        log.info(f"[SIZE] Loss streak {S['loss_streak']} → risk 60%")
+    elif S["loss_streak"] == 2:
+        risk_usd *= 0.8
+
+    size = risk_usd / sl_distance
+    margin = (size * price) / lev
+
+    # Cap margin at 20% of balance
+    max_margin = bal * 0.20
+    if margin > max_margin:
+        scale  = max_margin / margin
+        size   *= scale
+        margin  = max_margin
+        log.info(f"[SIZE] {sym} margin capped at 20% of balance "
+                 f"(risk reduced to ${size * sl_distance:.2f})")
+
+    size = round(size, spec["precision"])
+    if size < spec["min_size"]:
+        log.warning(f"[SIZE] {sym} size {size} < min {spec['min_size']} "
+                    f"(need more capital) — skip")
+        return 0, 0, 0
+
+    actual_risk = size * sl_distance
+    log.info(f"[SIZE] {sym} size={size} | margin=${margin:.2f} | "
+             f"risk at SL=${actual_risk:.2f} ({actual_risk/bal*100:.2f}% of bal)")
+    return size, margin, actual_risk
+
+# ═══════════════════════════════════════════════════════════
+# POSITION MANAGEMENT
+# ═══════════════════════════════════════════════════════════
 
 def manage_position(pos):
+    """Move SL to breakeven near TP1; keep TPs armed."""
     sym  = pos.get("symbol")
     hold = pos.get("holdSide", "long")
     try:
@@ -2428,964 +746,540 @@ def manage_position(pos):
         entry = float(pos.get("openPriceAvg", mark))
         pnl   = float(pos.get("unrealizedPL", 0))
     except (ValueError, TypeError) as e:
-        log.warning(f"[MGR] {sym} invalid numeric data: {e} — skip")
+        log.warning(f"[MGR] {sym} invalid data: {e}")
         return
-    if not (mark == mark and entry == entry and size == size):
-        log.warning(f"[MGR] {sym} NaN in position data — skip")
-        return
-    if mark <= 0 or entry <= 0:
-        log.warning(
-            f"[MGR] {sym} non-positive price (mark=${mark}, entry=${entry}) — skip"
-        )
-        return
-    if size <= 0:
-        return
-
-    start_bal = S.get("start_bal", 0)
-    if start_bal > 0 and pnl < 0:
-        unrealized_pct = abs(pnl) / start_bal
-        if unrealized_pct > 0.05:
-            log.warning(
-                f"[MGR] {sym} unrealized loss {unrealized_pct*100:.1f}% "
-                "of start_bal — flash crash risk"
-            )
-
-    meta = S["trade_meta"].get(sym, {})
-    if not meta:
-        log.debug(f"[MGR] {sym} no metadata — skipping")
-        return
-    trail = meta.get("trail", mark * 0.01)
-
-    if "current_sl" in meta:
-        current_sl = meta["current_sl"]
-    else:
-        sl_distance = trail * (SL_MULT / TRAIL_MULT)
-        current_sl  = (entry - sl_distance) if hold == "long" else (entry + sl_distance)
-        log.warning(f"[MGR] {sym} current_sl missing — fallback ${current_sl:,.2f}")
-
-    tp1    = meta.get("tp1", 0)
-    margin = meta.get("margin", 1)
-    pnl_pct = (pnl / margin) * 100 if margin else 0
-    log.info(
-        f"[MGR] {sym} {hold.upper()} Mark:${mark:,.2f} "
-        f"PnL:{pnl:+.4f}({pnl_pct:+.1f}%) SL:${current_sl:,.2f}"
-    )
-
-    if hold == "long":
-        new_sl = mark - trail
-        if new_sl > current_sl and mark > entry * 1.005:
-            sl_improvement = (new_sl - current_sl) / current_sl if current_sl > 0 else 1
-            if sl_improvement >= MIN_SL_IMPROVE:
-                if update_sl_atomic(sym, hold, new_sl, size):
-                    meta["current_sl"]   = new_sl
-                    S["trade_meta"][sym] = meta
-                    save_state()
-        elif tp1 > 0 and mark >= tp1 and not meta.get("be_moved"):
-            be = entry * 1.003
-            if be > current_sl:
-                if update_sl_atomic(sym, hold, be, size):
-                    meta["current_sl"]   = be
-                    meta["be_moved"]     = True
-                    S["trade_meta"][sym] = meta
-                    save_state()
-                    log.info(f"[TRAIL] {sym} TP1 hit! SL → BE")
-    elif hold == "short":
-        new_sl = mark + trail
-        if new_sl < current_sl and mark < entry * 0.995:
-            sl_improvement = (current_sl - new_sl) / current_sl if current_sl > 0 else 1
-            if sl_improvement >= MIN_SL_IMPROVE:
-                if update_sl_atomic(sym, hold, new_sl, size):
-                    meta["current_sl"]   = new_sl
-                    S["trade_meta"][sym] = meta
-                    save_state()
-        elif tp1 > 0 and mark <= tp1 and not meta.get("be_moved"):
-            be = entry * 0.997
-            if be < current_sl:
-                if update_sl_atomic(sym, hold, be, size):
-                    meta["current_sl"]   = be
-                    meta["be_moved"]     = True
-                    S["trade_meta"][sym] = meta
-                    save_state()
-                    log.info(f"[TRAIL] {sym} TP1 hit! SL → BE")
-
-
-def manage_funding_position(pos):
-    """
-    v6.5: Exit management for funding reversion strategy.
-
-    Exits:
-      TP1 (40%): funding normalizes to ±0.01% — collect easy money
-      TP2 (40%): price touches 4H VWAP — mean reversion confirmed
-      TP3 (20%): runner with 1× ATR trailing stop
-      SL: 2× ATR from entry (placed on exchange at entry)
-      SL_alt: funding flips to opposite extreme — thesis broken, exit all
-      Max hold: 72 hours — force close
-    """
-    sym  = pos.get("symbol")
-    hold = pos.get("holdSide", "long")
-    try:
-        mark  = float(pos.get("markPrice", 0))
-        size  = float(pos.get("total", 0))
-        entry = float(pos.get("openPriceAvg", mark))
-        pnl   = float(pos.get("unrealizedPL", 0))
-    except (ValueError, TypeError) as e:
-        log.warning(f"[FR-MGR] {sym} invalid numeric data: {e} — skip")
-        return
-    if not (mark == mark and entry == entry and size == size):
-        log.warning(f"[FR-MGR] {sym} NaN in position data — skip")
+    if not (mark == mark and entry == entry):  # NaN check
         return
     if mark <= 0 or entry <= 0 or size <= 0:
         return
 
     meta = S["trade_meta"].get(sym, {})
     if not meta:
-        log.debug(f"[FR-MGR] {sym} no metadata — skip")
         return
 
-    margin = meta.get("margin", 1)
-    pnl_pct = (pnl / margin) * 100 if margin else 0
-    open_ts = meta.get("open_ts", int(time.time() * 1000))
-    hold_hours = (int(time.time() * 1000) - open_ts) / 3600000
-    entry_funding = meta.get("entry_funding", 0)
-    vwap_4h = meta.get("vwap_4h", 0)
+    margin  = meta.get("margin", 1)
+    tp1     = meta.get("tp1", 0)
+    tp2     = meta.get("tp2", 0)
+    pnl_pct = (pnl / margin * 100) if margin else 0
 
-    log.info(f"[FR-MGR] {sym} {hold.upper()} Mark:${mark:,.2f} "
-             f"PnL:{pnl:+.4f}({pnl_pct:+.1f}%) held:{hold_hours:.1f}h")
+    log.info(f"[MGR] {sym} {hold.upper()} Mark:${mark:,.2f} "
+             f"PnL:{pnl:+.4f} ({pnl_pct:+.1f}%)")
 
-    # ── Check current funding for normalize / flip ──
-    cur_funding, _ = pub_funding(sym)
+    # [FIX-1] BE trigger = 80% of the DISTANCE from entry to TP1.
+    # Old code used 95% of raw PRICE, which is BELOW entry for any
+    # realistic ATR — fired instantly and scratched every trade.
+    if not meta.get("be_moved") and tp1 > 0:
+        if hold == "long":
+            tp1_reached = mark >= entry + BE_TRIGGER * (tp1 - entry)
+        else:
+            tp1_reached = mark <= entry - BE_TRIGGER * (entry - tp1)
 
-    # ── EXIT 1: Max hold time (72h) — force close everything ──
-    if hold_hours >= FR_MAX_HOLD_HOURS:
-        log.warning(f"[FR-MGR] {sym} max hold {FR_MAX_HOLD_HOURS}h reached — force close")
-        _funding_close_all(sym, hold, size, "max_hold")
-        return
+        if tp1_reached:
+            # [FIX-15] SAFE BE SEQUENCE — never a naked moment:
+            #   1. Snapshot existing loss-plan IDs (incl. the preset SL
+            #      Bitget auto-created, which we have no stored ID for)
+            #   2. Place the NEW breakeven SL first
+            #   3. Only if it confirms, cancel the OLD SL(s) by ID
+            #   TPs are never touched, so no re-arm step exists at all.
+            be_price = entry * (1.001 if hold == "long" else 0.999)
 
-    # ── EXIT 2: Funding flipped to opposite extreme — thesis broken ──
-    was_positive = entry_funding > 0
-    if was_positive and cur_funding < -FR_FLIP:
-        log.warning(f"[FR-MGR] {sym} funding flipped negative "
-                    f"({cur_funding*100:.3f}%) — thesis broken, close all")
-        _funding_close_all(sym, hold, size, "funding_flip")
-        return
-    if (not was_positive) and cur_funding > FR_FLIP:
-        log.warning(f"[FR-MGR] {sym} funding flipped positive "
-                    f"({cur_funding*100:.3f}%) — thesis broken, close all")
-        _funding_close_all(sym, hold, size, "funding_flip")
-        return
+            old_sl_ids = get_loss_plan_ids(sym, hold)
+            new_sl_id  = place_plan_order(sym, "loss_plan", be_price, hold, size)
 
-    # ── EXIT 3: TP1 — funding normalized (close 40%) ──
-    if not meta.get("fr_tp1_done") and abs(cur_funding) < FR_NORMALIZE:
-        tp1_size = _round_size(sym, meta.get("orig_size", size) * FR_TP1_PCT)
-        if tp1_size > 0 and tp1_size <= size:
-            close_side = "sell" if hold == "long" else "buy"
-            res = place_market_order(sym, close_side, tp1_size, "close")
-            if res and res.get("code") == "00000":
-                meta["fr_tp1_done"] = True
-                # Move SL to breakeven on remaining 60% — lock in no-loss.
-                # After collecting funding + closing 40%, the rest should never
-                # turn into a loss if price reverses.
-                entry_price = meta.get("entry_price", entry)
-                remaining = size - tp1_size
-                if remaining > 0:
-                    # Small buffer past entry to cover fees (0.3%)
-                    be_sl = entry_price * (0.997 if hold == "short" else 1.003)
-                    if update_sl_atomic(sym, hold, be_sl, remaining):
-                        meta["current_sl"] = be_sl
-                        log.info(f"[FR-MGR] {sym} SL → breakeven ${be_sl:.2f} "
-                                 f"(remaining {remaining})")
+            if new_sl_id:
+                for oid in old_sl_ids:
+                    if oid != new_sl_id:
+                        cancel_plan_order_by_id(sym, oid)
+                meta["current_sl"] = be_price
+                meta["sl_oid"]     = new_sl_id
+                meta["be_moved"]   = True
                 S["trade_meta"][sym] = meta
                 save_state()
-                log.info(f"[FR-MGR] {sym} ✅ TP1: funding normalized "
-                         f"({cur_funding*100:.4f}%) — closed 40%")
-                notify(f"💰 {sym} FR-TP1: funding normalized, closed 40%, SL→BE",
-                       urgent=True)
-        return
-
-    # ── EXIT 4: TP2 — price touches VWAP (close 40%) ──
-    if not meta.get("fr_tp2_done") and vwap_4h > 0:
-        vwap_touched = (
-            (hold == "short" and mark <= vwap_4h) or
-            (hold == "long" and mark >= vwap_4h)
-        )
-        if vwap_touched:
-            tp2_size = _round_size(sym, meta.get("orig_size", size) * FR_TP2_PCT)
-            if tp2_size > 0 and tp2_size <= size:
-                close_side = "sell" if hold == "long" else "buy"
-                res = place_market_order(sym, close_side, tp2_size, "close")
-                if res and res.get("code") == "00000":
-                    meta["fr_tp2_done"] = True
-                    S["trade_meta"][sym] = meta
-                    save_state()
-                    log.info(f"[FR-MGR] {sym} ✅ TP2: price hit VWAP "
-                             f"${vwap_4h:.2f} — closed 40%")
-                    notify(f"💰 {sym} FR-TP2: hit VWAP, closed 40%", urgent=True)
-            return
-
-    # ── EXIT 5: TP3 runner — trail remaining 20% with 1× ATR ──
-    if meta.get("fr_tp2_done"):
-        atr_v = meta.get("atr", mark * 0.01)
-        trail = atr_v  # 1× ATR trailing
-        current_sl = meta.get("current_sl", entry)
-        if hold == "long":
-            new_sl = mark - trail
-            if new_sl > current_sl and mark > entry:
-                sl_imp = (new_sl - current_sl) / current_sl if current_sl > 0 else 1
-                if sl_imp >= MIN_SL_IMPROVE:
-                    if update_sl_atomic(sym, hold, new_sl, size):
-                        meta["current_sl"] = new_sl
-                        S["trade_meta"][sym] = meta
-                        save_state()
-                        log.info(f"[FR-MGR] {sym} TP3 trail SL → ${new_sl:.2f}")
-        else:
-            new_sl = mark + trail
-            if new_sl < current_sl and mark < entry:
-                sl_imp = (current_sl - new_sl) / current_sl if current_sl > 0 else 1
-                if sl_imp >= MIN_SL_IMPROVE:
-                    if update_sl_atomic(sym, hold, new_sl, size):
-                        meta["current_sl"] = new_sl
-                        S["trade_meta"][sym] = meta
-                        save_state()
-                        log.info(f"[FR-MGR] {sym} TP3 trail SL → ${new_sl:.2f}")
-
-
-def _round_size(sym, raw_size):
-    """Round size to symbol precision."""
-    spec = SYMBOL_SPECS.get(sym, {"precision": 4})
-    return round(raw_size, spec["precision"])
-
-
-def _funding_close_all(sym, hold, size, reason):
-    """Close entire funding position with retries."""
-    cancel_all_plan_orders(sym)
-    close_side = "sell" if hold == "long" else "buy"
-    for attempt in range(3):
-        res = place_market_order(sym, close_side, size, "close")
-        if res and res.get("code") == "00000":
-            log.info(f"[FR-MGR] {sym} closed ({reason})")
-            notify(f"🔚 {sym} funding position closed: {reason}", urgent=True)
-            return True
-        time.sleep(2)
-    log.critical(f"[FR-MGR] {sym} CLOSE FAILED ({reason})")
-    notify(f"🚨 {sym} funding close FAILED — check manually!", urgent=True)
-    return False
-
-
-def _execute_funding_trade(sym, sig, size, margin):
-    """
-    v6.5: Execute a funding reversion trade.
-    Places SL on exchange (2× ATR). TP1/TP2/TP3 are managed dynamically
-    by manage_funding_position (funding-normalize, VWAP, trailing).
-    """
-    if not set_leverage(sym, FR_MAX_LEVERAGE):
-        log.error(f"[FR-ENTRY] {sym} leverage failed — abort")
-        return
-
-    res = place_market_order(sym, sig["side"], size, "open")
-    time.sleep(1.5)
-
-    # Verify position opened (3 retries)
-    actual_pos = None
-    for attempt in range(3):
-        positions = fetch_positions()
-        if positions is None:
-            log.warning(f"[FR-ENTRY] {sym} verify {attempt+1}: API failed")
-            time.sleep(2)
-            continue
-        for p in positions:
-            if p.get("symbol") == sym and float(p.get("total", 0)) > 0:
-                actual_pos = p
-                break
-        if actual_pos:
-            break
-        time.sleep(2)
-
-    if not actual_pos:
-        err = res.get("msg", "order failed") if res else "no response"
-        log.error(f"[FR-ENTRY] {sym} order failed: {err}")
-        return
-
-    actual_size  = float(actual_pos.get("total", 0))
-    actual_entry = float(actual_pos.get("openPriceAvg", sig["price"]))
-    log.info(f"[FR-ENTRY] ✅ {sig['action']} OPENED size={actual_size} "
-             f"@ ${actual_entry:.2f}")
-
-    # Recompute SL from actual fill (2× ATR)
-    atr_v = sig["atr"]
-    if sig["hold"] == "long":
-        actual_sl = actual_entry - atr_v * FR_SL_ATR_MULT
-    else:
-        actual_sl = actual_entry + atr_v * FR_SL_ATR_MULT
-
-    # Place SL immediately
-    spec = SYMBOL_SPECS.get(sym, {"price_precision": 2})
-    px_prec = spec.get("price_precision", 2)
-    sl_ok = place_plan_order(sym, "loss_plan",
-                             round(actual_sl, px_prec),
-                             sig["hold"], actual_size)
-    if not sl_ok:
-        log.error(f"[FR-ENTRY] {sym} SL failed — emergency close")
-        _funding_close_all(sym, sig["hold"], actual_size, "SL_place_failed")
-        return
-
-    log.info(f"[FR-ENTRY] 🛡️ SL @ ${actual_sl:.2f} — protected")
-
-    # Store metadata (note: TP1/TP2/TP3 managed dynamically, not placed on exchange)
-    S["trade_meta"][sym] = {
-        "entry_price":         actual_entry,
-        "entry_time":          datetime.now(timezone.utc).isoformat(),
-        "open_ts":             int(time.time() * 1000),
-        "side":                sig["hold"],
-        "lev":                 FR_MAX_LEVERAGE,
-        "margin":              margin,
-        "size":                actual_size,
-        "orig_size":           actual_size,  # for partial TP calc
-        "current_sl":          actual_sl,
-        "atr":                 atr_v,
-        "vwap_4h":             sig["vwap_4h"],
-        "entry_funding":       sig["entry_funding"],
-        "strategy":            "funding_reversion",
-        "fr_tp1_done":         False,
-        "fr_tp2_done":         False,
-        "last_unrealized_pnl": 0.0,
-        "last_mark":           actual_entry,
-    }
-    save_state()
-    notify(f"🎯 {sym} {sig['action']} (FUNDING) @ ${actual_entry:,.2f}\n"
-           f"Funding:{sig['entry_funding']*100:.3f}% SL:${actual_sl:,.2f}\n"
-           f"VWAP target:${sig['vwap_4h']:,.2f}", urgent=True)
-    time.sleep(3)
-
+                log.info(f"[MGR] {sym} 80% to TP1 — SL → BE ${be_price:.2f} "
+                         f"(old SL cancelled, TPs untouched)")
+                notify(f"📈 {sym} near TP1 — SL moved to breakeven", urgent=True)
+            else:
+                # New BE SL failed — we did NOT cancel anything, so the
+                # original SL is still fully active. Position never naked.
+                log.error(f"[MGR] {sym} BE SL placement failed — "
+                          f"original SL still active, will retry next cycle")
 
 def detect_closed_positions(open_pos):
-    exchange_syms = {p.get("symbol") for p in open_pos}
+    """Detect positions that closed (via SL/TP on exchange)."""
+    open_syms = {p.get("symbol") for p in (open_pos or [])}
     for sym in list(S["trade_meta"].keys()):
-        if sym in exchange_syms:
-            continue
-        meta = S["trade_meta"][sym]
-        log.info(f"[CLOSED] {sym} closed on exchange")
+        if sym not in open_syms:
+            meta = S["trade_meta"][sym]
 
-        # FIX-11: look up per-trade margin for the relative PnL threshold
-        trade_margin = meta.get("margin", 0) if isinstance(meta, dict) else 0
+            # [FIX-11] only count fills AFTER this trade's entry time
+            entry_ms = 0
+            try:
+                entry_ms = int(datetime.fromisoformat(
+                    meta.get("entry_time", "")).timestamp() * 1000)
+            except Exception:
+                pass
 
-        actual_pnl  = 0.0
-        fills_found = False
-        try:
-            entry_time_str = meta.get("entry_time", "")
-            if entry_time_str:
-                entry_time_ms = int(
-                    datetime.fromisoformat(entry_time_str).timestamp() * 1000
-                )
-                fills = fetch_recent_fills(sym, 30)
+            res = call("GET", "/api/v2/mix/order/fills",
+                       params={"symbol": sym, "productType": PRODUCT_TYPE,
+                               "limit": "20"})
+            actual_pnl = 0.0
+            if res and res.get("data"):
+                fills = res["data"].get("fillList", [])
                 for fill in fills:
-                    fill_time  = int(fill.get("cTime", 0))
-                    trade_side = fill.get("tradeSide", "").lower()
-                    if fill_time >= entry_time_ms and "close" in trade_side:
-                        try:
-                            actual_pnl += float(fill.get("profit", 0))
-                            fills_found = True
-                        except (ValueError, TypeError):
-                            pass
-        except Exception as e:
-            log.warning(f"[FILL parse] {sym}: {e}")
+                    if fill.get("tradeSide") not in ("close_long", "close_short", "close"):
+                        continue
+                    try:
+                        c_time = int(fill.get("cTime", 0))
+                        if entry_ms and c_time and c_time < entry_ms:
+                            continue  # [FIX-11] fill from an older trade
+                        actual_pnl += float(fill.get("profit", 0))
+                    except Exception:
+                        pass
 
-        if not fills_found:
-            last_pnl = meta.get("last_unrealized_pnl", None)
-            if last_pnl is None or last_pnl == 0.0:
-                entry     = meta.get("entry_price", 0)
-                last_mark = meta.get("last_mark", entry)
-                size      = meta.get("size", 0)
-                side      = meta.get("side", "long")
-                if entry > 0 and last_mark > 0 and size > 0:
-                    actual_pnl = (
-                        (last_mark - entry) * size
-                        if side == "long"
-                        else (entry - last_mark) * size
-                    )
+            if actual_pnl == 0:
+                actual_pnl = meta.get("last_pnl", 0)
+
+            S["total_pnl"] += actual_pnl
+            S["daily_pnl"] += actual_pnl
+            threshold = max(0.01, meta.get("margin", 1) * 0.002)
+            if actual_pnl > threshold:
+                S["wins"]       += 1
+                S["win_streak"] += 1
+                S["loss_streak"] = 0
+                result = f"WIN +${actual_pnl:.4f}"
+                notify(f"{sym} WIN +${actual_pnl:.4f}", urgent=True)
+            elif actual_pnl < -threshold:
+                S["losses"]      += 1
+                S["loss_streak"] += 1
+                S["win_streak"]   = 0
+                result = f"LOSS -${abs(actual_pnl):.4f}"
+                notify(f"{sym} LOSS -${abs(actual_pnl):.4f}", urgent=True)
             else:
-                actual_pnl = last_pnl
-            log.info(f"[CLOSED] {sym} using estimated PnL (fills not found)")
+                result = "Breakeven"
+                notify(f"{sym} closed breakeven", urgent=True)
+
+            log.info(f"[CLOSE] {sym} closed — {result} | "
+                     f"W:{S['wins']} L:{S['losses']}")
+
+            if sym in S["pending_orders"]:
+                del S["pending_orders"][sym]
+            # Position is gone — cancel any leftover trigger orders
+            # (remaining TP, stale SL, or a duplicate SL if the
+            # plan-ID query schema ever mismatches). Safe: cancel-all
+            # with no open position only removes orphans.
+            cancel_all_plan_orders(sym)
+            del S["trade_meta"][sym]
+            save_state()
+
+# ═══════════════════════════════════════════════════════════
+# ENTRY EXECUTION
+# ═══════════════════════════════════════════════════════════
+
+def execute_entry(sym, sig, bal):
+    """Place LIMIT order at EMA21 with pre-armed SL."""
+    price = sig["limit_price"]
+    # SL/TP already computed relative to the limit price in generate_signal
+    size, margin, actual_risk = calc_position_size(
+        bal, price, sig["sl"], MAX_LEVERAGE, sym)
+    if size <= 0:
+        return
+
+    if not set_leverage(sym, MAX_LEVERAGE):
+        log.error(f"[ENTRY] {sym} leverage failed")
+        return
+
+    if SHADOW_MODE:
+        log.info(f"[SHADOW] 👻 Would place LIMIT {sig['action']} {sym} "
+                 f"@ ${price:.2f} size={size} margin=${margin:.2f} "
+                 f"risk=${actual_risk:.2f}")
+        notify(f"👻 SHADOW: {sym} {sig['action']} LIMIT @ ${price:.2f} | "
+               f"SL:${sig['sl']:.2f} TP:${sig['tp1']:.2f}", urgent=False)
+        return
+
+    # [FIX-7] SL rides on the entry order itself
+    oid = place_limit_order(sym, sig["side"], size, price, preset_sl=sig["sl"])
+    if not oid:
+        return
+
+    S["pending_orders"][sym] = {
+        "order_id":   oid,
+        "side":       sig["side"],
+        "hold":       sig["hold"],
+        "limit_px":   price,
+        "sl":         sig["sl"],
+        "tp1":        sig["tp1"],
+        "tp2":        sig["tp2"],
+        "atr":        sig["atr"],
+        "size":       size,
+        "margin":     margin,
+        "placed_ts":  int(time.time() * 1000),
+    }
+    save_state()
+    log.info(f"[ENTRY] ✅ LIMIT placed: {sym} {sig['action']} @ ${price:.2f} "
+             f"size={size} ID:{oid}")
+    notify(f"📋 {sym} LIMIT {sig['action']} @ ${price:.2f}\n"
+           f"SL:${sig['sl']:.2f} (pre-armed) TP:${sig['tp1']:.2f}\n"
+           f"Waiting for fill...", urgent=True)
+
+def _activate_filled_entry(sym, order, size, fill_price, partial=False):
+    """
+    [FIX-16] Shared activation for full AND partial fills: compute TPs
+    from actual entry, place the TP split, register in trade_meta.
+    The SL is already armed by the exchange (preset on the order).
+    Previously a partial fill that expired left a REAL position with
+    an SL but no TPs and no tracking — this closes that hole.
+    """
+    actual_entry = fill_price if fill_price > 0 else order["limit_px"]
+    atr  = order["atr"]
+    hold = order["hold"]
+    if hold == "long":
+        tp1 = actual_entry + atr * ATR_TP_MULT
+        tp2 = actual_entry + atr * ATR_TP2_MULT
+    else:
+        tp1 = actual_entry - atr * ATR_TP_MULT
+        tp2 = actual_entry - atr * ATR_TP2_MULT
+
+    spec = SYMBOL_SPECS.get(sym, {"precision": 4, "min_size": 0})
+    size = round(size, spec["precision"])
+    if size < spec.get("min_size", 0):
+        log.warning(f"[FILL] {sym} fill size {size} below min — "
+                    f"position too small to manage, leaving exchange SL armed")
+        return
+
+    half = round(size * 0.5, spec["precision"])
+    rest = round(size - half, spec["precision"])
+    tp1_oid = tp2_oid = None
+    if half >= spec.get("min_size", 0):
+        tp1_oid = place_plan_order(sym, "profit_plan", tp1, hold, half)
+    if rest >= spec.get("min_size", 0):
+        tp2_oid = place_plan_order(sym, "profit_plan", tp2, hold, rest)
+
+    S["trade_meta"][sym] = {
+        "entry_price": actual_entry,
+        "entry_time":  datetime.now(timezone.utc).isoformat(),
+        "side":        hold,
+        "lev":         MAX_LEVERAGE,
+        "margin":      order["margin"] * (size / order["size"]
+                                          if order.get("size") else 1),
+        "size":        size,
+        "current_sl":  order["sl"],   # pre-armed preset SL
+        "tp1":         tp1,
+        "tp2":         tp2,
+        "tp1_oid":     tp1_oid,
+        "tp2_oid":     tp2_oid,
+        "atr":         atr,
+        "be_moved":    False,
+        "last_pnl":    0.0,
+        "last_mark":   actual_entry,
+    }
+    save_state()
+    tag = "PARTIAL FILL" if partial else "FILLED"
+    notify(f"✅ {sym} {hold.upper()} {tag} @ ${actual_entry:.2f} "
+           f"(size {size})\nSL:${order['sl']:.2f} "
+           f"TP1:${tp1:.2f} TP2:${tp2:.2f}", urgent=True)
+
+def check_pending_orders():
+    """
+    Check pending limit orders.
+    [FIX-7]  SL is pre-armed on the order; on fill only TPs are added.
+    [FIX-16] Raw status is logged (Bitget v2 vocabulary: live /
+             partially_filled / filled / canceled) and a partial fill
+             at expiry becomes a tracked position instead of being
+             silently abandoned.
+    Cancel after 2 candles (8h) if unfilled.
+    """
+    now_ms = int(time.time() * 1000)
+    CANCEL_AFTER_MS = 8 * 3600 * 1000  # 2 x 4H candles
+
+    for sym, order in list(S["pending_orders"].items()):
+        oid = order["order_id"]
+        status, filled_size, fill_price = check_limit_order_filled(sym, oid)
+        # [FIX-16] log the raw status so the real vocabulary can be
+        # verified during shadow/early-live instead of assumed
+        log.info(f"[FILL] {sym} order {oid} raw status='{status}' "
+                 f"filled={filled_size}")
+
+        if status in ("full_fill", "filled"):
+            log.info(f"[FILL] {sym} limit order FILLED @ ${fill_price:.2f}")
+            _activate_filled_entry(
+                sym, order,
+                filled_size if filled_size > 0 else order["size"],
+                fill_price)
+            del S["pending_orders"][sym]
+            save_state()
+
+        elif status in ("cancelled", "canceled", "cancel"):
+            if filled_size > 0:
+                # cancelled after a partial fill — a real position exists
+                log.warning(f"[FILL] {sym} cancelled with partial fill "
+                            f"{filled_size} — activating position")
+                _activate_filled_entry(sym, order, filled_size,
+                                       fill_price, partial=True)
+            else:
+                log.info(f"[FILL] {sym} order cancelled externally")
+            del S["pending_orders"][sym]
+            save_state()
+
+        elif now_ms - order["placed_ts"] > CANCEL_AFTER_MS:
+            log.info(f"[FILL] {sym} limit order expired (8h) — cancelling")
+            cancel_limit_order(sym, oid)
+            # [FIX-16] re-check after cancel: any partially-filled size
+            # is a LIVE position that must be protected and tracked
+            time.sleep(1)
+            status2, filled2, fillpx2 = check_limit_order_filled(sym, oid)
+            if filled2 > 0:
+                log.warning(f"[FILL] {sym} expired order had partial fill "
+                            f"{filled2} — activating position")
+                _activate_filled_entry(sym, order, filled2, fillpx2,
+                                       partial=True)
+                notify(f"⚠️ {sym} limit expired with PARTIAL fill {filled2} "
+                       f"— now managed as open position", urgent=True)
+            else:
+                notify(f"⏱️ {sym} limit order expired — price moved away",
+                       urgent=False)
+            del S["pending_orders"][sym]
+            save_state()
+
         else:
-            log.info(f"[CLOSED] {sym} actual realized PnL from fills")
+            age_h = (now_ms - order["placed_ts"]) / 3600000
+            log.info(f"[FILL] {sym} limit order pending ({age_h:.1f}h)")
 
-        # FIX-3: relative threshold so small-margin trades are still classified
-        pnl_threshold = max(0.01, trade_margin * 0.002) if trade_margin > 0 else 0.01
-
-        if actual_pnl > pnl_threshold:
-            S["wins"]       += 1
-            S["win_streak"] += 1
-            S["loss_streak"] = 0
-            log.info(f"[WIN] {sym} +${actual_pnl:.4f}")
-            notify(f"✅ {sym} WIN ${actual_pnl:+.2f}", urgent=True)
-            pat_sig = meta.get("pattern_sig")
-            if pat_sig:
-                update_pattern_memory(pat_sig, won=True)
-                log.info(f"[LEARN] ✅ Pattern '{pat_sig}' → WIN recorded")
-        elif actual_pnl < -pnl_threshold:
-            S["losses"]      += 1
-            S["loss_streak"] += 1
-            S["win_streak"]   = 0
-            log.info(f"[LOSS] {sym} ${actual_pnl:.4f}")
-            notify(f"❌ {sym} LOSS ${actual_pnl:+.2f}", urgent=True)
-            pat_sig = meta.get("pattern_sig")
-            if pat_sig:
-                update_pattern_memory(pat_sig, won=False)
-                log.info(f"[LEARN] ❌ Pattern '{pat_sig}' → LOSS recorded")
-        else:
-            log.info(f"[BREAKEVEN] {sym} closed @ ~$0 PnL (no streak change)")
-            notify(f"➖ {sym} closed @ breakeven", urgent=True)
-
-        S["daily_pnl"] += actual_pnl
-        S["total_pnl"] += actual_pnl
-        record_trade_outcome(actual_pnl)
-        if actual_pnl < 0:
-            cb_pause, cb_reason = check_circuit_breakers(S.get("start_bal", 100))
-            if cb_pause and ("consecutive" in cb_reason or "hourly" in cb_reason):
-                trip_circuit_breaker(cb_reason)
-        cancel_all_plan_orders(sym)
-        del S["trade_meta"][sym]
-        save_state()
-
-
-# ── Reporting ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# REPORTING
+# ═══════════════════════════════════════════════════════════
 
 def print_report(bal):
-    start  = S["start_bal"]
+    start = S["start_bal"]
     growth = ((bal - start) / start * 100) if start > 0 else 0
-    dd     = ((S["peak_bal"] - bal) / S["peak_bal"] * 100) if S["peak_bal"] > 0 else 0
-    total  = S["wins"] + S["losses"]
-    wr     = (S["wins"] / total * 100) if total > 0 else 0
+    dd = ((S["peak_bal"] - bal) / S["peak_bal"] * 100) if S["peak_bal"] > 0 else 0
+    total = S["wins"] + S["losses"]
+    wr = S["wins"] / total * 100 if total > 0 else 0
+
     log.info("╔══════════════════════════════════════╗")
-    log.info("║   💰 ARES v6.4 REPORT                ║")
+    log.info(f"║  💰 ARES v7.2 REPORT")
     log.info(f"║  Balance:  ${bal:.2f}")
     log.info(f"║  Growth:   {growth:+.2f}%")
     log.info(f"║  Drawdown: {dd:.2f}%")
     log.info(f"║  PnL:      ${S['total_pnl']:+.4f}")
     log.info(f"║  WinRate:  {wr:.1f}% ({S['wins']}W/{S['losses']}L)")
-    pm = S.get("pattern_memory", {})
-    log.info(f"║  Patterns: {len(pm)} learned")
-    # FIX-4: flag ephemeral state in the report
-    if _STATE_FILE_IS_EPHEMERAL:
-        log.info("║  ⚠️  State: /tmp (EPHEMERAL)")
-    cb_paused = S.get("cb_paused_until", 0)
-    if cb_paused and int(time.time() * 1000) < cb_paused:
-        remaining = (cb_paused - int(time.time() * 1000)) // 60000
-        log.info(f"║  ⛔ CB:    paused {remaining}min more")
-    shadow = S.get("shadow_trades", [])
-    if shadow:
-        log.info(f"║  Shadow:   {len(shadow)} logged trades")
+    log.info(f"║  Strategy: EMA Pullback 4H")
+    if SHADOW_MODE:
+        log.info(f"║  Mode:     SHADOW (no real trades)")
+    if S["paused_today"]:
+        log.info(f"║  ⛔ Entries paused (daily loss limit)")
     log.info("╚══════════════════════════════════════╝")
-    if pm:
-        print_pattern_summary()
-    if shadow:
-        print_shadow_summary()
 
-
-# ── Main Loop ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════════════════════════
 
 def run():
-    global OUTAGE_DETECTED
     log.info("╔══════════════════════════════════════════════════╗")
-    log.info("║  ▲ ARES ULTRA v6.5 — Multi-Strategy              ║")
-    log.info("║  +Circuit Breakers +Outage Detect +Regime +Shadow║")
-    strat_label = "FUNDING REVERSION" if STRATEGY == "funding_reversion" else "TECHNICAL"
-    log.info(f"║  Strategy: {strat_label:<38}║")
-    if STRATEGY == "funding_reversion":
-        log.info(
-            f"║  FR: {FR_POSITION_PCT*100:.0f}% size | {FR_MAX_LEVERAGE}x lev | "
-            f"thresh {FR_THRESHOLD*100:.2f}% | hold {FR_MAX_HOLD_HOURS}h ║"
-        )
+    log.info("║  ▲ ARES v7.2 — EMA Pullback Strategy (4H)       ║")
+    log.info(f"║  Risk:{RISK_PCT*100:.1f}%/trade (TRUE risk) | Lev:{MAX_LEVERAGE}x | "
+             f"Max:{MAX_TRADES}")
+    log.info(f"║  Orders: LIMIT + preset SL | TF: 4H closed candles")
+    if SHADOW_MODE:
+        log.info("║  ⚠️  SHADOW MODE — No real trades (default ON)")
     else:
-        log.info(
-            f"║  Compound:{COMPOUND_PCT*100:.0f}% | MaxLev:{MAX_LEVERAGE}x | "
-            f"Trades:{MAX_TRADES}     ║"
-        )
+        log.info("║  🔴 LIVE MODE — Real money")
     log.info("╚══════════════════════════════════════════════════╝")
 
-    # FIX-4: re-emit state path warning at startup (already logged at import
-    # time if /app was not writable, but worth repeating in the run banner)
-    if _STATE_FILE_IS_EPHEMERAL:
-        log.warning(
-            "[INIT] ⚠️  Using EPHEMERAL state at /tmp — "
-            "set STATE_FILE_PATH to a persistent path!"
-        )
-
     if not API_KEY or not SECRET_KEY or not PASSPHRASE:
-        log.error("❌ API keys missing!")
+        log.error("❌ API keys missing — check Railway variables")
         return
+
+    if not check_exchange_health():
+        log.error("[INIT] Bitget unreachable — waiting...")
+        for _ in range(60):
+            time.sleep(60)
+            if check_exchange_health():
+                break
+
+    # [FIX-12] verify hedge mode before any order logic runs.
+    # Retry a few times; if STILL unverifiable: abort in LIVE mode
+    # (never trade real money on an unconfirmed assumption), but allow
+    # SHADOW mode to proceed with a warning (no orders are placed).
+    pos_mode = ""
+    for _ in range(3):
+        pos_mode = check_position_mode()
+        if pos_mode:
+            break
+        time.sleep(5)
+    if pos_mode and "hedge" not in pos_mode.lower():
+        log.error(f"❌ Account is in '{pos_mode}' — this bot requires "
+                  f"HEDGE mode (tradeSide/holdSide semantics). Switch "
+                  f"position mode on Bitget, then restart.")
+        notify("❌ ARES requires Hedge Mode on Bitget — bot stopped",
+               urgent=True)
+        return
+    if not pos_mode:
+        if SHADOW_MODE:
+            log.warning("[INIT] Could not verify position mode — "
+                        "SHADOW mode, proceeding (no real orders)")
+        else:
+            log.error("❌ Could not verify position mode and LIVE mode "
+                      "is enabled — refusing to trade on an unconfirmed "
+                      "assumption. Check API permissions and restart.")
+            notify("❌ ARES: position mode unverifiable in LIVE — stopped",
+                   urgent=True)
+            return
 
     load_state()
     if RESET_STATS:
-        reset_stats()
-
-    if not check_exchange_health():
-        log.error("[INIT] Bitget unreachable on startup — waiting for recovery")
-        OUTAGE_DETECTED = True
-        wait_for_exchange_recovery()
+        for key in ["start_bal", "daily_start_bal", "peak_bal", "total_pnl",
+                    "daily_pnl", "wins", "losses", "loss_streak", "win_streak"]:
+            S[key] = 0.0 if isinstance(S[key], float) else 0
+        S["pending_orders"] = {}
+        S["trade_meta"] = {}
+        S["paused_today"] = False
+        save_state()
 
     bal = fetch_balance()
-    if bal == 0:
-        log.warning("[INIT] Balance $0 — verify API keys and futures balance")
-    else:
-        log.info(f"[INIT] Balance: ${bal:.2f} USDT")
-    if S["start_bal"] == 0:
-        S["start_bal"] = bal
-    if S["peak_bal"] == 0:
-        S["peak_bal"] = bal
-    notify(
-        f"🚀 ARES v6.5 [{STRATEGY}] started | Balance: ${bal:.2f}"
-        f"{' [SHADOW]' if SHADOW_MODE else ''}",
-        urgent=True,
-    )
+    if S["start_bal"] == 0:       S["start_bal"] = bal
+    if S["peak_bal"] == 0:        S["peak_bal"]  = bal
+    if S["daily_start_bal"] == 0: S["daily_start_bal"] = bal  # [FIX-10]
+    S["daily_start"] = datetime.now(timezone.utc).date()
+
+    log.info(f"[INIT] Balance: ${bal:.2f} USDT"
+             f"{' [SHADOW]' if SHADOW_MODE else ' [LIVE]'}")
+    notify(f"🚀 ARES v7.2 started | ${bal:.2f}"
+           f"{' [SHADOW]' if SHADOW_MODE else ' [LIVE]'}", urgent=True)
 
     cycle = 0
     while True:
         try:
             cycle += 1
-            now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             today = datetime.now(timezone.utc).date()
-            if not isinstance(S["daily_start"], type(today)):
-                S["daily_start"] = today
-            if today != S["daily_start"]:
-                log.info("🔄 New day — daily PnL reset")
-                S["daily_pnl"]   = 0
-                S["daily_start"] = today
+
+            # Daily reset
+            if S["daily_start"] and today != S["daily_start"]:
+                log.info("🔄 New day — daily PnL reset, entries re-enabled")
+                S["daily_pnl"]       = 0
+                S["daily_start"]     = today
+                S["daily_start_bal"] = fetch_balance()  # [FIX-10]
+                S["paused_today"]    = False             # [FIX-8]
                 save_state()
 
             log.info(f"\n{'═'*52}")
-            log.info(f"  CYCLE {cycle} | {now}{' [SHADOW]' if SHADOW_MODE else ''}")
+            log.info(f"  CYCLE {cycle} | {now}")
             log.info(f"{'═'*52}")
 
             if not check_exchange_health():
-                OUTAGE_DETECTED = True
-                wait_for_exchange_recovery()
+                log.warning("[HEALTH] Bitget unreachable — skip cycle")
+                time.sleep(SCAN_INTERVAL)
                 continue
 
             bal = fetch_balance()
-            if bal > S["peak_bal"]:
-                S["peak_bal"] = bal
+            if bal > S["peak_bal"]: S["peak_bal"] = bal
 
-            process_cb_expiry()
-            cb_pause, cb_reason = check_circuit_breakers(bal)
-            if cb_pause:
-                log.warning(f"⛔ [CIRCUIT BREAKER] {cb_reason}")
-                save_state()
-                time.sleep(SCAN_INTERVAL)
-                continue
-
-            if S["start_bal"] > 0:
-                loss_pct = S["daily_pnl"] / S["start_bal"]
-                if loss_pct <= -MAX_DAILY_LOSS:
-                    now_utc  = datetime.now(timezone.utc)
-                    tomorrow = (now_utc + timedelta(days=1)).replace(
-                        hour=0, minute=5, second=0, microsecond=0
-                    )
-                    sleep_secs = int((tomorrow - now_utc).total_seconds())
-                    hours      = sleep_secs // 3600
-                    log.warning(
-                        f"⛔ Daily loss {MAX_DAILY_LOSS*100:.0f}% hit! "
-                        f"Pausing {hours}h until next day"
-                    )
-                    notify(f"⛔ Daily loss limit hit. Pausing {hours}h.", urgent=True)
+            # [FIX-8 + FIX-10] Daily loss limit: set a pause flag, keep
+            # running. Positions and pending orders are STILL managed —
+            # only new entries are blocked until next UTC day.
+            denom = S["daily_start_bal"] or S["start_bal"]
+            if denom > 0 and not S["paused_today"]:
+                if S["daily_pnl"] / denom <= -MAX_DAILY_LOSS:
+                    S["paused_today"] = True
                     save_state()
-                    time.sleep(sleep_secs)
-                    S["daily_pnl"] = 0
-                    continue
-
-            total = S["wins"] + S["losses"]
-            wr    = (S["wins"] / total * 100) if total > 0 else 0
-            log.info(
-                f"[BAL] ${bal:.2f} | Day:${S['daily_pnl']:+.4f} | "
-                f"Total:${S['total_pnl']:+.4f} | "
-                f"{S['wins']}W/{S['losses']}L ({wr:.0f}%)"
-            )
-
-            if bal < 6:
-                log.warning("[SKIP] Balance < $6")
-                time.sleep(SCAN_INTERVAL)
-                continue
+                    log.warning("⛔ Daily loss limit hit — NEW entries paused "
+                                "until next UTC day (positions still managed)")
+                    notify("⛔ Daily loss limit hit — new entries paused. "
+                           "Open positions still being managed.", urgent=True)
 
             open_pos = fetch_positions()
             if open_pos is None:
-                log.error("[POS] fetch_positions failed — skip cycle for safety")
+                log.error("[POS] fetch_positions failed — skip for safety")
                 time.sleep(SCAN_INTERVAL)
                 continue
 
-            log.info(
-                f"[POS] {len(open_pos)} open | "
-                f"Tracked: {list(S['trade_meta'].keys())}"
-            )
+            log.info(f"[POS] {len(open_pos)} open | "
+                     f"Tracked:{list(S['trade_meta'].keys())} | "
+                     f"Pending:{list(S['pending_orders'].keys())}")
 
-            # Update fallback PnL data BEFORE detect_closed_positions reads it
+            # Update unrealized PnL BEFORE detect_closed
             for pos in open_pos:
                 sym = pos.get("symbol")
                 if sym in S["trade_meta"]:
                     try:
-                        S["trade_meta"][sym]["last_unrealized_pnl"] = float(
-                            pos.get("unrealizedPL", 0)
-                        )
-                        S["trade_meta"][sym]["last_mark"] = float(
-                            pos.get("markPrice", 0)
-                        )
-                    except (ValueError, TypeError):
+                        S["trade_meta"][sym]["last_mark"] = float(pos.get("markPrice", 0))
+                        S["trade_meta"][sym]["last_pnl"]  = float(pos.get("unrealizedPL", 0))
+                    except Exception:
                         pass
 
             detect_closed_positions(open_pos)
-
-            if SHADOW_MODE:
-                update_shadow_outcomes()
+            check_pending_orders()
 
             for pos in open_pos:
-                # v6.5: Route to correct manager based on strategy
-                psym = pos.get("symbol")
-                pmeta = S["trade_meta"].get(psym, {})
-                if pmeta.get("strategy") == "funding_reversion":
-                    manage_funding_position(pos)
-                else:
+                sym = pos.get("symbol")
+                if sym in S["trade_meta"]:
                     manage_position(pos)
 
             if cycle % 20 == 0:
                 print_report(bal)
 
-            # Bug B (inherited): all_open = union of exchange + tracked positions.
-            exchange_syms   = {p.get("symbol") for p in open_pos}
-            tracked_syms    = set(S["trade_meta"].keys())
-            all_open        = exchange_syms | tracked_syms
-            live_open_count = len(all_open)
-
-            if live_open_count >= MAX_TRADES:
-                log.info(
-                    f"[SKIP] {MAX_TRADES} trades open "
-                    f"(tracked:{len(tracked_syms)} exchange:{len(exchange_syms)})"
-                )
+            # [FIX-8] entries blocked while paused — management above
+            # already ran this cycle
+            if S["paused_today"]:
+                log.info("[SKIP] Entries paused (daily loss limit)")
                 save_state()
                 time.sleep(SCAN_INTERVAL)
                 continue
 
+            exchange_syms = {p.get("symbol") for p in open_pos}
+            tracked_syms  = set(S["trade_meta"].keys())
+            pending_syms  = set(S["pending_orders"].keys())
+            all_open = exchange_syms | tracked_syms | pending_syms
+
+            if len(all_open) >= MAX_TRADES:
+                log.info(f"[SKIP] {len(all_open)}/{MAX_TRADES} trades active")
+                save_state()
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            # ── Signal scan ──
             for sym in SYMBOLS:
                 if sym in all_open:
-                    log.info(f"[{sym}] Position open — skip")
+                    log.info(f"[{sym}] Position/order active — skip scan")
                     continue
 
-                log.info(f"\n[SCAN] ━━━ {sym} ━━━━━━━━━━━━━━━━━━━━━━━")
-                tick       = pub_ticker(sym)
-                cdata_full = pub_candles(sym, "15", 350)
-                fund_rate, fund_mins = pub_funding(sym)
-                if not tick or not cdata_full:
-                    log.warning(f"[{sym}] No market data")
-                    continue
-                cdata = cdata_full[-150:] if len(cdata_full) >= 150 else cdata_full
+                log.info(f"\n[SCAN] ━━━ {sym} ━━━━━━━━━━━━━━━━━")
 
-                if fund_mins == -1 and abs(fund_rate) > 0.0008:
-                    log.warning(
-                        f"[{sym}] Funding time unknown @ "
-                        f"{fund_rate*100:.3f}% (extreme) — skip"
-                    )
-                    continue
-                if fund_mins != -1 and fund_mins < 15 and abs(fund_rate) > 0.0005:
-                    log.warning(
-                        f"[{sym}] Funding in {fund_mins}m @ "
-                        f"{fund_rate*100:.3f}% — skip"
-                    )
+                candles = pub_candles_4h(sym, limit=200)
+                if not candles or len(candles) < 61:
+                    log.warning(f"[{sym}] Not enough 4H candles")
                     continue
 
-                price    = float(tick.get("lastPr", 0))
-                chg      = float(tick.get("change24h", 0)) * 100
-                fund_str = f"{fund_mins}m" if fund_mins != -1 else "?"
-                log.info(
-                    f"[{sym}] ${price:,.2f} | {chg:+.2f}% | "
-                    f"Fund:{fund_rate*100:.4f}% (in {fund_str})"
-                )
-
-                # ════════════════════════════════════════════════════
-                # v6.5: STRATEGY ROUTING
-                # ════════════════════════════════════════════════════
-                if STRATEGY == "funding_reversion":
-                    sig = funding_signal(sym, tick, cdata)
-                    if not sig:
-                        continue
-
-                    em = "🟢" if sig["action"] == "LONG" else "🔴"
-                    log.info(f"[FR-SIG] {em} {sig['action']} | "
-                             f"funding={sig['entry_funding']*100:.4f}% | "
-                             f"4H RSI={sig['rsi_4h']:.0f} | VWAP=${sig['vwap_4h']:.2f}")
-                    for r in sig["reasons"]:
-                        log.info(f"  {r}")
-
-                    # Funding strategy: NO mini-backtest, NO pattern memory
-                    # (different setup type, too few trades to learn)
-                    # Correlation check still applies via compound_size
-
-                    # Funding-specific sizing: 3% balance × streak multiplier, 3x lev
-                    streak = sig.get("funding_streak", FR_CONSECUTIVE)
-                    streak_mult = funding_streak_multiplier(streak)
-                    fr_margin = bal * FR_POSITION_PCT * streak_mult
-                    # Hard cap: never exceed 6% of balance even with streak bonus
-                    fr_margin = min(fr_margin, bal * 0.06)
-                    fr_size = (fr_margin * FR_MAX_LEVERAGE) / price
-                    spec = SYMBOL_SPECS.get(sym, {"min_size": 0.0001, "precision": 4})
-                    fr_size = round(fr_size, spec["precision"])
-                    if streak_mult > 1.0:
-                        log.info(f"[FR] {sym} streak={streak} → size ×{streak_mult:.2f}")
-
-                    if fr_size < spec["min_size"]:
-                        log.warning(f"[FR] {sym} size {fr_size} < min "
-                                    f"{spec['min_size']} (need more capital) — skip")
-                        continue
-
-                    # Correlation check
-                    if is_correlated_with_open(sym, new_side=sig["hold"]):
-                        log.info(f"[FR] {sym} correlated with open position — skip")
-                        continue
-
-                    log.info(f"[FR ✅ APPROVED] {sym} {sig['action']} "
-                             f"size={fr_size} margin=${fr_margin:.2f}")
-
-                    if SHADOW_MODE:
-                        log_shadow_trade(sym, sig, fr_size, fr_margin)
-                        save_state()
-                        continue
-
-                    _execute_funding_trade(sym, sig, fr_size, fr_margin)
+                tick = pub_ticker(sym)
+                if not tick:
                     continue
-                # ════════════════════════════════════════════════════
-                # TECHNICAL STRATEGY (v6.4 — unchanged)
-                # ════════════════════════════════════════════════════
 
-                sig = generate_signal(sym, tick, cdata, fund_rate)
+                price = float(tick.get("lastPr", 0))
+                chg   = float(tick.get("change24h", 0)) * 100
+                log.info(f"[{sym}] ${price:,.2f} | {chg:+.2f}% | "
+                         f"4H candles:{len(candles)}")
+
+                sig = generate_signal(sym, candles, price)
                 if not sig:
-                    log.info(f"[{sym}] No signal")
                     continue
 
-                em = "🟢" if sig["action"] == "LONG" else "🔴" if sig["action"] == "SHORT" else "🟡"
-                log.info(
-                    f"[SIG] {em} {sig['action']} | Conf:{sig['conf']}% | "
-                    f"Lev:{sig['lev']}x | R:R {sig['rr']}"
-                )
-                log.info(
-                    f"[IND] RSI:{sig['rsi']:.0f} MACD:{sig['macd_h']:+.2f} "
-                    f"Stoch:{sig['stoch']:.0f} Vol:{sig['vol_r']:.1f}x"
-                )
-                log.info(f"[SCR] 🟢{sig['bull']} vs 🔴{sig['bear']}")
-                for r in sig["reasons"][:3]:
+                for r in sig.get("reasons", []):
                     log.info(f"  {r}")
 
-                if sig["action"] not in ("LONG", "SHORT") or sig["conf"] < MIN_CONF:
-                    log.info(f"[{sym}] {sig['action']} conf:{sig['conf']}% — wait")
-                    continue
+                execute_entry(sym, sig, bal)
 
-                # ── Mini-Backtest ──────────────────────────────────────
-                bt_start = time.time()
-                bt_ok, bt_reason = check_mini_backtest(
-                    cdata_full, sig["action"], sig["atr"], sig=sig
-                )
-                log.info(f"[BACKTEST] {bt_reason} ({(time.time()-bt_start)*1000:.0f}ms)")
-                if not bt_ok:
-                    log.warning(f"[{sym}] ⚠️ Mini-backtest fail — SKIP")
-                    notify(f"⚠️ {sym} {sig['action']} skipped (backtest: {bt_reason})")
-                    continue
-
-                # ── Pattern Memory ─────────────────────────────────────
-                sig_key = get_pattern_signature(sig)
-                should_trade, reason = check_pattern_history(sig_key)
-                log.info(f"[LEARN] Pattern: {sig_key}")
-                log.info(f"[LEARN] History: {reason}")
-                if not should_trade:
-                    log.warning(f"[{sym}] ⚠️ Pattern has poor history — SKIP")
-                    notify(f"⚠️ {sym} {sig['action']} skipped (poor pattern: {reason})")
-                    continue
-
-                log.info("[✅ APPROVED] Both filters passed → executing trade")
-
-                size, margin = compound_size(
-                    bal, price, sig["lev"], sig["conf"], sym, side=sig["hold"]
-                )
-                if size <= 0:
-                    continue
-
-                log.info(
-                    f"[ENTRY] {sym} margin:${margin} size:{size} lev:{sig['lev']}x"
-                )
-                log.info(
-                    f"[RISK] SL:${sig['sl']:,.2f} TP1:${sig['tp1']:,.2f} "
-                    f"TP2:${sig['tp2']:,.2f} TP3:${sig['tp3']:,.2f}"
-                )
-
-                # Shadow mode — log but don't execute
-                if SHADOW_MODE:
-                    log_shadow_trade(sym, sig, size, margin)
-                    save_state()
-                    continue
-
-                if not set_leverage(sym, sig["lev"]):
-                    log.error(f"[ENTRY] {sym} leverage failed — abort")
-                    continue
-
-                res = place_market_order(sym, sig["side"], size, "open")
-                time.sleep(1.5)
-
-                # Verify position actually opened
-                actual_pos = None
-                for verify_attempt in range(3):
-                    current_positions = fetch_positions()
-                    if current_positions is None:
-                        log.warning(
-                            f"[ENTRY] {sym} verify attempt {verify_attempt+1}: API failed"
-                        )
-                        time.sleep(2)
-                        continue
-                    for p in current_positions:
-                        if p.get("symbol") == sym and float(p.get("total", 0)) > 0:
-                            actual_pos = p
-                            break
-                    if actual_pos:
-                        break
-                    log.warning(
-                        f"[ENTRY] {sym} verify attempt {verify_attempt+1}: no position yet"
-                    )
-                    time.sleep(2)
-
-                if not actual_pos:
-                    # FIX-2: res is now always a dict, safe to call .get()
-                    err = res.get("msg", "order failed or not confirmed")
-                    log.error(
-                        f"[ENTRY] {sym} order failed after 3 verify attempts: {err}"
-                    )
-                    continue
-
-                actual_size  = float(actual_pos.get("total", 0))
-                actual_entry = float(actual_pos.get("openPriceAvg", price))
-                # FIX-2: res is always a dict, .get() is safe
-                oid = res.get("data", {}).get("orderId", "N/A") if res else "verified"
-                log.info(
-                    f"[ENTRY] ✅ {sig['action']} OPENED size={actual_size} "
-                    f"@ ${actual_entry:.2f} ID:{oid}"
-                )
-
-                # Recompute SL/TP from actual fill price
-                atr_v = sig["atr"]
-                if sig["hold"] == "long":
-                    actual_sl  = actual_entry - atr_v * SL_MULT
-                    actual_tp1 = actual_entry + atr_v * TP1_MULT
-                    actual_tp2 = actual_entry + atr_v * TP2_MULT
-                    actual_tp3 = actual_entry + atr_v * TP3_MULT
-                else:
-                    actual_sl  = actual_entry + atr_v * SL_MULT
-                    actual_tp1 = actual_entry - atr_v * TP1_MULT
-                    actual_tp2 = actual_entry - atr_v * TP2_MULT
-                    actual_tp3 = actual_entry - atr_v * TP3_MULT
-
-                if abs(actual_entry - sig["price"]) / sig["price"] > 0.0005:
-                    log.info(
-                        f"[ENTRY] SL/TP recomputed from actual fill "
-                        f"(diff {(actual_entry-sig['price'])/sig['price']*10000:.1f} bps)"
-                    )
-
-                # Place SL immediately to minimise naked-position window
-                spec    = SYMBOL_SPECS.get(sym, {"price_precision": 2})
-                px_prec = spec.get("price_precision", 2)
-                sl_first = place_plan_order(
-                    sym, "loss_plan",
-                    round(actual_sl, px_prec),
-                    sig["hold"], actual_size,
-                )
-                if not sl_first:
-                    log.error(f"[ENTRY] {sym} SL placement failed — emergency close")
-                    cancel_all_plan_orders(sym)
-                    close_side = "sell" if sig["side"] == "buy" else "buy"
-                    closed     = False
-                    for close_attempt in range(3):
-                        close_res = place_market_order(sym, close_side, actual_size, "close")
-                        if close_res.get("code") == "00000":  # FIX-2: always a dict
-                            closed = True
-                            break
-                        time.sleep(2)
-                    if not closed:
-                        notify(
-                            f"🚨 CRITICAL: {sym} SL+close failed — NAKED POSITION",
-                            urgent=True,
-                        )
-                    else:
-                        notify(f"⚠️ {sym} closed — SL placement failed", urgent=True)
-                    continue
-
-                log.info(f"[ENTRY] 🛡️ SL placed @ ${actual_sl:.2f} — position now protected")
-
-                if not setup_protection(
-                    sym, sig["hold"], actual_sl,
-                    actual_tp1, actual_tp2, actual_tp3,
-                    actual_size, skip_sl=True,
-                ):
-                    log.error(f"[ENTRY] {sym} TP placement failed — closing position")
-                    cancel_all_plan_orders(sym)
-                    close_side = "sell" if sig["side"] == "buy" else "buy"
-                    closed     = False
-                    for close_attempt in range(3):
-                        close_res = place_market_order(sym, close_side, actual_size, "close")
-                        if close_res.get("code") == "00000":  # FIX-2: always a dict
-                            closed = True
-                            break
-                        time.sleep(2)
-                    if not closed:
-                        notify(
-                            f"🚨 CRITICAL: {sym} close failed after TP fail — NAKED",
-                            urgent=True,
-                        )
-                    else:
-                        notify(f"⚠️ {sym} closed — TP setup failed", urgent=True)
-                    continue
-
-                sig["sl"]    = actual_sl
-                sig["tp1"]   = actual_tp1
-                sig["tp2"]   = actual_tp2
-                sig["tp3"]   = actual_tp3
-                sig["price"] = actual_entry
-
-                S["trade_meta"][sym] = {
-                    "entry_price":         actual_entry,
-                    "entry_time":          datetime.now(timezone.utc).isoformat(),
-                    "side":                sig["hold"],
-                    "lev":                 sig["lev"],
-                    "margin":              margin,
-                    "size":                actual_size,
-                    "trail":               sig["trail"],
-                    "current_sl":          sig["sl"],
-                    "tp1":                 sig["tp1"],
-                    "tp2":                 sig["tp2"],
-                    "tp3":                 sig["tp3"],
-                    "be_moved":            False,
-                    "signal_score":        sig["bull"] if sig["action"] == "LONG" else sig["bear"],
-                    "confidence":          sig["conf"],
-                    "last_unrealized_pnl": 0.0,
-                    "last_mark":           actual_entry,
-                    "pattern_sig":         sig_key,
-                }
-                save_state()
-                # Bug C (inherited): show actual_entry (fill price), not pre-entry market quote
-                notify(
-                    f"🎯 {sym} {sig['action']} @ ${actual_entry:,.2f}\n"
-                    f"Lev:{sig['lev']}x Conf:{sig['conf']}%\n"
-                    f"SL:${sig['sl']:,.2f} TP3:${sig['tp3']:,.2f}",
-                    urgent=True,
-                )
-                time.sleep(3)
-
-            log.info(f"\n[SLEEP] {SCAN_INTERVAL}s...")
             save_state()
-            flush_notifications()
             time.sleep(SCAN_INTERVAL)
 
         except KeyboardInterrupt:
-            log.info("Stopped by user.")
+            log.info("\n[STOP] Bot stopped")
+            notify("🛑 ARES v7.2 stopped", urgent=True)
             save_state()
-            flush_notifications()
-            notify("🛑 ARES stopped", urgent=True)
             break
         except Exception as e:
             log.error(f"[ERROR] Cycle {cycle}: {e}", exc_info=True)
             notify(f"⚠️ Bot error: {e}", urgent=True)
             try:
-                flush_notifications()
                 save_state()
             except Exception:
                 pass
