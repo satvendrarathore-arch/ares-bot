@@ -317,11 +317,11 @@ def pub_ticker(sym):
 def fetch_balance():
     """
     Robust balance fetch with field fallbacks + diagnostics.
-    Bitget account-list fields vary by margin mode — try several,
+    Bitget account fields vary by margin mode — try several,
     and log the raw response whenever we'd otherwise return $0
     so the real schema is visible in Railway logs.
     """
-    res = call("GET", "/api/v2/mix/account/account-list",
+    res = call("GET", "/api/v2/mix/account/accounts",
                params={"productType": PRODUCT_TYPE})
     if res and res.get("data"):
         for acc in res["data"]:
@@ -339,10 +339,10 @@ def fetch_balance():
                 log.warning(f"[BAL] USDT account found but all balance "
                             f"fields 0 — raw: {json.dumps(acc)[:400]}")
                 return 0.0
-        log.warning(f"[BAL] No USDT entry in account-list — raw: "
+        log.warning(f"[BAL] No USDT entry in accounts — raw: "
                     f"{json.dumps(res.get('data'))[:400]}")
     else:
-        log.warning(f"[BAL] account-list failed: "
+        log.warning(f"[BAL] accounts query failed: "
                     f"code={res.get('code') if res else None} "
                     f"msg={res.get('msg') if res else None}")
     return 0.0
@@ -367,16 +367,30 @@ def check_position_mode():
     [FIX-12] This bot's order semantics (tradeSide=open/close,
     holdSide on plan orders) assume HEDGE mode. Bitget ignores
     tradeSide in one-way mode, which silently changes behavior.
-    Verify at startup and refuse to run in the wrong mode.
+
+    Uses the SINGLE-account endpoint (/account), which returns
+    posMode/holdMode — the list endpoint (/accounts) does not.
+    Field is "posMode" (hedge_mode/one_way_mode) on v2; older
+    payloads used "holdMode" (double_hold/single_hold). Accept both.
     """
-    res = call("GET", "/api/v2/mix/account/account-list",
-               params={"productType": PRODUCT_TYPE})
-    if res and res.get("data"):
-        for acc in res["data"]:
-            if acc.get("marginCoin") == "USDT":
-                mode = str(acc.get("posMode", ""))
-                log.info(f"[INIT] Position mode: {mode or 'unknown'}")
-                return mode
+    res = call("GET", "/api/v2/mix/account/account",
+               params={"symbol": "BTCUSDT", "productType": PRODUCT_TYPE,
+                       "marginCoin": "USDT"})
+    if res and res.get("code") == "00000" and res.get("data"):
+        d = res["data"]
+        # single-account returns an object; be tolerant if a list comes back
+        if isinstance(d, list):
+            d = d[0] if d else {}
+        mode = str(d.get("posMode") or d.get("holdMode") or "")
+        log.info(f"[INIT] Position mode: {mode or 'unknown'}")
+        # normalise the legacy "double_hold" → hedge for the caller's check
+        if mode == "double_hold":
+            return "hedge_mode"
+        if mode == "single_hold":
+            return "one_way_mode"
+        return mode
+    log.warning(f"[INIT] Position-mode query failed: "
+                f"code={res.get('code') if res else None}")
     return ""
 
 # ═══════════════════════════════════════════════════════════
