@@ -315,12 +315,36 @@ def pub_ticker(sym):
     return None
 
 def fetch_balance():
+    """
+    Robust balance fetch with field fallbacks + diagnostics.
+    Bitget account-list fields vary by margin mode — try several,
+    and log the raw response whenever we'd otherwise return $0
+    so the real schema is visible in Railway logs.
+    """
     res = call("GET", "/api/v2/mix/account/account-list",
                params={"productType": PRODUCT_TYPE})
     if res and res.get("data"):
         for acc in res["data"]:
-            if acc.get("marginCoin") == "USDT":
-                return float(acc.get("available", 0))
+            if str(acc.get("marginCoin", "")).upper() == "USDT":
+                for field in ("available", "crossedMaxAvailable",
+                              "isolatedMaxAvailable", "maxTransferOut",
+                              "accountEquity", "usdtEquity"):
+                    try:
+                        v = float(acc.get(field) or 0)
+                    except (TypeError, ValueError):
+                        v = 0.0
+                    if v > 0:
+                        return v
+                # All fields zero/missing — show what Bitget actually sent
+                log.warning(f"[BAL] USDT account found but all balance "
+                            f"fields 0 — raw: {json.dumps(acc)[:400]}")
+                return 0.0
+        log.warning(f"[BAL] No USDT entry in account-list — raw: "
+                    f"{json.dumps(res.get('data'))[:400]}")
+    else:
+        log.warning(f"[BAL] account-list failed: "
+                    f"code={res.get('code') if res else None} "
+                    f"msg={res.get('msg') if res else None}")
     return 0.0
 
 def fetch_positions():
